@@ -1,0 +1,9 @@
+[project]
+name = "scalping"
+version = "0.1.0"
+description = "Bot scalpers for limited drops at online retailers"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "botasaurus>=4.0.97",
+]
