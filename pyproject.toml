@@ -6,4 +6,20 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "botasaurus>=4.0.97",
+    "python-dotenv>=1.0.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["scraping"]

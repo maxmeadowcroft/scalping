@@ -1,0 +1,33 @@
+{
+  "refresh_interval_seconds": 5,
+  "refresh_jitter_seconds": 1.5,
+  "max_atc_retries": 3,
+  "dry_run": true,
+  "place_order": false,
+  "prefer_pickup": true,
+  "preferred_store_name": "Albuquerque Wyoming",
+  "checkout_auth_timeout_seconds": 300,
+  "shipping_address": {
+    "name": "",
+    "street": "3604 Garcia St NE",
+    "street2": "",
+    "city": "Albuquerque",
+    "state": "NM",
+    "zip": "87111",
+    "phone": ""
+  },
+  "items": [
+    {
+      "url": "https://www.target.com/p/drizzilicious-lemon-drizzled-mini-rice-cake-4oz/-/A-95049011#lnk=sametab",
+      "max_quantity": 1,
+      "label": "drizzilicious-lemon-rice-cake",
+      "enabled": true
+    },
+    {
+      "url": "https://www.target.com/p/-/A-95120838",
+      "max_quantity": 1,
+      "label": "one-piece-starter-deck-31",
+      "enabled": true
+    }
+  ]
+}

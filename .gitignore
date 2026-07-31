@@ -5,7 +5,8 @@ __pycache__/
 .ruff_cache/
 .DS_Store
 profiles/
+profiles.json
 output/
 *.log
 .env
-session capture/*_cookies.json
+sessions/*_cookies.json
