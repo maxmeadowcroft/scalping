@@ -15,6 +15,7 @@ Safety: dry_run stops before Place order.
 
 from __future__ import annotations
 
+import random
 import sys
 import time
 from dataclasses import dataclass
@@ -46,19 +47,19 @@ class CheckoutResult:
     order_number: str | None = None
 
 
-def _click_text(driver: Driver, text: str, wait: float = 2.0) -> bool:
+def _click_text(driver: Driver, text: str, wait: float = 1.0) -> bool:
     try:
         el = driver.get_element_containing_text(text, wait=wait)
         if el is None:
             return False
         el.click()
-        driver.sleep(0.8)
+        time.sleep(random.uniform(0.03, 0.08))
         return True
     except Exception:
         return False
 
 
-def _click_selector(driver: Driver, selector: str, wait: float = 2.0) -> bool:
+def _click_selector(driver: Driver, selector: str, wait: float = 1.0) -> bool:
     try:
         el = driver.select(selector, wait)
         if el is None:
@@ -69,7 +70,7 @@ def _click_selector(driver: Driver, selector: str, wait: float = 2.0) -> bool:
             driver.run_js(
                 f"document.querySelector({selector!r})?.click()"
             )
-        driver.sleep(0.8)
+        time.sleep(random.uniform(0.03, 0.08))
         return True
     except Exception:
         return False
@@ -89,6 +90,82 @@ def _js_click(driver: Driver, selector: str) -> bool:
         )
     except Exception:
         return False
+
+
+def _human_pause(driver: Driver, lo: float = 0.05, hi: float = 0.14) -> None:
+    """Tiny jittered pause — use time.sleep (Botasaurus driver.sleep is noisy/slow)."""
+    time.sleep(random.uniform(lo, hi))
+
+
+def _human_click_selector(driver: Driver, selector: str) -> bool:
+    """Fast human-like pointer click with pixel jitter (never for #passkey)."""
+    if "passkey" in selector.lower():
+        return False
+    ox = round(random.uniform(-0.2, 0.2), 3)
+    oy = round(random.uniform(-0.2, 0.2), 3)
+    try:
+        result = driver.run_js(
+            f"""
+            const el = document.querySelector({selector!r});
+            if (!el) return {{ok: false}};
+            if ((el.id || '').toLowerCase() === 'passkey') return {{ok: false}};
+            el.scrollIntoView({{block: 'center', inline: 'nearest'}});
+            try {{ el.focus({{preventScroll: true}}); }} catch (e) {{}}
+            const r = el.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2) return {{ok: false}};
+            const x = r.left + r.width * (0.5 + {ox});
+            const y = r.top + r.height * (0.5 + {oy});
+            const opts = (buttons) => ({{
+              bubbles: true, cancelable: true, view: window,
+              clientX: x, clientY: y, button: 0, buttons,
+              pointerId: 1, pointerType: 'mouse', isPrimary: true,
+            }});
+            el.dispatchEvent(new PointerEvent('pointerover', opts(0)));
+            el.dispatchEvent(new MouseEvent('mouseover', opts(0)));
+            el.dispatchEvent(new PointerEvent('pointerdown', opts(1)));
+            el.dispatchEvent(new MouseEvent('mousedown', opts(1)));
+            el.dispatchEvent(new PointerEvent('pointerup', opts(0)));
+            el.dispatchEvent(new MouseEvent('mouseup', opts(0)));
+            el.dispatchEvent(new MouseEvent('click', opts(0)));
+            try {{ el.click(); }} catch (e) {{}}
+            return {{ok: true, text: ((el.innerText || '') + '').replace(/\\s+/g, ' ').trim().slice(0, 60)}};
+            """
+        )
+    except Exception:
+        return False
+    if isinstance(result, dict) and result.get("ok"):
+        _human_pause(driver, 0.03, 0.09)
+        return True
+    return _js_click(driver, selector)
+
+
+def _spam_until(
+    driver: Driver,
+    *,
+    action,
+    success,
+    label: str,
+    max_tries: int = 20,
+    peek_lo: float = 0.05,
+    peek_hi: float = 0.12,
+) -> bool:
+    """Fire action repeatedly with human jitter until success() is true."""
+    for i in range(1, max_tries + 1):
+        if success():
+            return True
+        ok = False
+        try:
+            ok = bool(action())
+        except Exception:
+            ok = False
+        if success():
+            if i > 1:
+                print(f"[SPAM] {label} landed on try {i}")
+            return True
+        _human_pause(driver, peek_lo, peek_hi)
+        if not ok and i % 5 == 0:
+            print(f"[SPAM] {label} still waiting ({i}/{max_tries})")
+    return bool(success())
 
 
 def _page_lower(driver: Driver) -> str:
@@ -135,16 +212,85 @@ def ensure_logged_in_hint(driver: Driver) -> str | None:
 
 
 def go_to_cart(driver: Driver) -> None:
-    if _click_text(driver, "View cart & check out", wait=2):
+    try:
+        url = (driver.current_url or "").lower()
+        if "/cart" in url and "checkout" not in url:
+            return
+    except Exception:
+        pass
+    # Prefer the post-ATC drawer CTA — JS click is fastest.
+    for sel in (
+        '[data-test="cartItem-checkoutButton"]',
+        'a[href="/cart"]',
+        '[data-test="@web/CartIcon"]',
+        '[data-test="@web/CartLink"]',
+    ):
+        if _js_click(driver, sel):
+            time.sleep(0.08)
+            return
+    try:
+        hit = driver.run_js(
+            """
+            const labels = ['view cart & check out', 'view cart and check out', 'view cart'];
+            const nodes = Array.from(document.querySelectorAll(
+              'a, button, [role="button"], [data-test*="cart" i]'
+            ));
+            for (const el of nodes) {
+              const t = ((el.innerText || el.getAttribute('aria-label') || '') + '')
+                .replace(/\\s+/g, ' ').trim().toLowerCase();
+              if (!t || t.length > 40) continue;
+              if (!labels.some((l) => t === l || t.startsWith(l))) continue;
+              const style = window.getComputedStyle(el);
+              if (style.display === 'none' || style.visibility === 'hidden') continue;
+              el.click();
+              return t;
+            }
+            return null;
+            """
+        )
+    except Exception:
+        hit = None
+    if hit:
+        time.sleep(0.08)
         return
-    if _click_text(driver, "View cart and check out", wait=1):
+    if _click_text(driver, "View cart & check out", wait=0.05):
+        time.sleep(0.08)
         return
-    if _click_selector(driver, 'a[href="/cart"]', wait=1):
-        return
-    if _click_selector(driver, '[data-test="cartItem-checkoutButton"]', wait=1):
+    if _click_text(driver, "View cart and check out", wait=0.05):
+        time.sleep(0.08)
         return
     driver.get("https://www.target.com/cart")
-    driver.sleep(2)
+    time.sleep(0.15)
+
+
+def open_cart_after_atc(driver: Driver, *, tries: int = 12) -> bool:
+    """Spam View cart / cart icon until we're on a non-empty cart."""
+
+    def _on_cart() -> bool:
+        try:
+            url = (driver.current_url or "").lower()
+            if "/cart" in url and "checkout" not in url:
+                return not cart_is_empty(driver)
+        except Exception:
+            pass
+        try:
+            return bool(
+                driver.run_js(
+                    "return !!document.querySelector('[data-test=\"checkout-button\"]')"
+                )
+            )
+        except Exception:
+            return False
+
+    return _spam_until(
+        driver,
+        action=lambda: (go_to_cart(driver) or True),
+        success=_on_cart,
+        label="View cart",
+        max_tries=tries,
+        peek_lo=0.04,
+        peek_hi=0.1,
+    )
 
 
 def clear_cart(driver: Driver, *, max_rounds: int = 12) -> None:
@@ -154,12 +300,10 @@ def clear_cart(driver: Driver, *, max_rounds: int = 12) -> None:
     which can hit unrelated UI and race with a fresh add-to-cart.
     """
     driver.get("https://www.target.com/cart")
-    driver.sleep(2.0)
+    driver.sleep(0.3)
     for _ in range(max_rounds):
         if cart_is_empty(driver):
             return
-        # Click every visible delete control in one pass (mixed ship+pickup carts
-        # often have multiple cartItem-deleteBtn nodes).
         removed = 0
         try:
             removed = int(
@@ -185,24 +329,30 @@ def clear_cart(driver: Driver, *, max_rounds: int = 12) -> None:
         if removed == 0:
             if not (
                 _js_click(driver, '[data-test="cartItem-deleteBtn"]')
-                or _click_selector(driver, '[data-test="cartItem-deleteBtn"]', wait=1.2)
+                or _click_selector(driver, '[data-test="cartItem-deleteBtn"]', wait=0.3)
             ):
                 break
-        driver.sleep(1.4)
-    driver.sleep(1.0)
+        driver.sleep(0.22)
+    driver.sleep(0.12)
 
 
 def cart_is_empty(driver: Driver) -> bool:
-    text = _page_lower(driver)
-    if "your cart is empty" in text or "cart is empty" in text:
-        return True
-    if driver.select('[data-test="cartItem"]', 0.5) is not None:
-        return False
-    if driver.select('[data-test="cartItem-deleteBtn"]', 0.5) is not None:
-        return False
-    if driver.select('[data-test="checkout-button"]', 0.5) is not None:
-        return False
-    return False
+    """Instant cart-empty check — no Botasaurus select waits."""
+    try:
+        return bool(
+            driver.run_js(
+                """
+                const text = ((document.body && document.body.innerText) || '').toLowerCase();
+                if (text.includes('your cart is empty') || text.includes('cart is empty')) return true;
+                if (document.querySelector('[data-test="cartItem-deleteBtn"], [data-test="cartItem"]')) return false;
+                if (document.querySelector('[data-test="checkout-button"]')) return false;
+                return true;
+                """
+            )
+        )
+    except Exception:
+        text = _page_lower(driver)
+        return "your cart is empty" in text or "cart is empty" in text
 
 
 def cart_line_count(driver: Driver) -> int:
@@ -223,7 +373,7 @@ def cart_line_count(driver: Driver) -> int:
 def trim_cart_to_max_lines(driver: Driver, max_lines: int = 1) -> int:
     """Delete excess cart lines (e.g. double-ATC left ship + pickup copies)."""
     go_to_cart(driver)
-    driver.sleep(1.0)
+    driver.sleep(0.2)
     rounds = 0
     while cart_line_count(driver) > max_lines and rounds < 8:
         rounds += 1
@@ -263,10 +413,10 @@ def trim_cart_to_max_lines(driver: Driver, max_lines: int = 1) -> int:
         if not deleted:
             if not (
                 _js_click(driver, '[data-test="cartItem-deleteBtn"]')
-                or _click_selector(driver, '[data-test="cartItem-deleteBtn"]', wait=1.0)
+                or _click_selector(driver, '[data-test="cartItem-deleteBtn"]', wait=0.35)
             ):
                 break
-        driver.sleep(1.3)
+        driver.sleep(0.28)
     count = cart_line_count(driver)
     if count > max_lines:
         print(f"[CART] warning: still {count} lines after trim (wanted ≤{max_lines})")
@@ -276,14 +426,24 @@ def trim_cart_to_max_lines(driver: Driver, max_lines: int = 1) -> int:
 
 
 def cart_has_items(driver: Driver) -> bool:
+    # Fast path: header cart badge / mini-cart CTA without a full navigation.
+    try:
+        if driver.select('[data-test="@web/CartLinkQuantity"]', 0.15) is not None:
+            return True
+        if driver.get_element_containing_text("View cart & check out", wait=0.15):
+            return True
+        if driver.get_element_containing_text("Added to cart", wait=0.1):
+            return True
+    except Exception:
+        pass
+
+    if open_cart_after_atc(driver, tries=3):
+        return True
     go_to_cart(driver)
-    driver.sleep(1.5)
+    driver.sleep(0.1)
     if not cart_is_empty(driver):
         return True
-    # Target sometimes lags after ATC — one soft refresh before declaring empty.
-    driver.sleep(2.0)
-    driver.get("https://www.target.com/cart")
-    driver.sleep(2.0)
+    driver.sleep(0.15)
     return not cart_is_empty(driver)
 
 
@@ -298,10 +458,10 @@ def pickup_available(driver: Driver) -> bool:
         'input[value="STORE_PICKUP"]',
         'label[for*="instore" i]',
     ):
-        if driver.select(selector, 0.8) is not None:
+        if driver.select(selector, 0.4) is not None:
             return True
     try:
-        return driver.get_element_containing_text("Order Pickup", wait=1) is not None
+        return driver.get_element_containing_text("Order Pickup", wait=0.5) is not None
     except Exception:
         return False
 
@@ -319,7 +479,7 @@ def select_preferred_store(driver: Driver, preferred_store_name: str) -> bool:
         "Select a store",
         "Edit store",
     ):
-        if _click_text(driver, label, wait=0.8):
+        if _click_text(driver, label, wait=0.5):
             opened = True
             break
     if not opened:
@@ -332,14 +492,14 @@ def select_preferred_store(driver: Driver, preferred_store_name: str) -> bool:
         'input[data-test*="store" i]',
         'input[type="search"]',
     ):
-        if _type_first(driver, [selector], preferred_store_name, wait=1):
-            driver.sleep(1.2)
+        if _type_first(driver, [selector], preferred_store_name, wait=0.6):
+            driver.sleep(0.5)
             break
 
-    if _click_text(driver, preferred_store_name, wait=2):
-        driver.sleep(1.0)
+    if _click_text(driver, preferred_store_name, wait=1):
+        driver.sleep(0.4)
         for label in ("Set as shopping store", "Shop this store", "Select", "Confirm"):
-            _click_text(driver, label, wait=0.5)
+            _click_text(driver, label, wait=0.35)
         return True
     return preferred_store_name.lower() in _page_lower(driver)
 
@@ -375,19 +535,19 @@ def switch_cart_to_pickup(driver: Driver, preferred_store_name: str) -> bool:
         "switch items to pickup instead",
         "Change to pickup",
     ):
-        if _click_text(driver, label, wait=1.2):
-            driver.sleep(2.0)
+        if _click_text(driver, label, wait=0.45):
+            driver.sleep(0.35)
             print(f"[FULFILLMENT] clicked {label!r}")
             break
 
     ok = select_pickup(driver, preferred_store_name)
     if ok:
-        driver.sleep(1.5)
+        driver.sleep(0.2)
     # Confirm we are no longer stuck on the $35 shipping gate
     if shipping_blocked_by_minimum(driver) and "pickup" not in _page_lower(driver).split("order pickup", 1)[0][-80:]:
         # One more pass on the banner CTA
-        _click_text(driver, "Change all to pickup", wait=1.0)
-        driver.sleep(1.5)
+        _click_text(driver, "Change all to pickup", wait=0.4)
+        driver.sleep(0.3)
         ok = select_pickup(driver, preferred_store_name) or ok
     return ok
 
@@ -422,12 +582,12 @@ def select_pickup(driver: Driver, preferred_store_name: str) -> bool:
     ]
     clicked = False
     for selector in candidates:
-        if _click_selector(driver, selector, wait=1) or _js_click(driver, selector):
-            driver.sleep(1.5)
+        if _click_selector(driver, selector, wait=0.35) or _js_click(driver, selector):
+            driver.sleep(0.25)
             clicked = True
             break
-    if not clicked and _click_text(driver, "Order Pickup", wait=2):
-        driver.sleep(1.5)
+    if not clicked and _click_text(driver, "Order Pickup", wait=0.5):
+        driver.sleep(0.25)
         clicked = True
     if not clicked:
         return False
@@ -443,11 +603,11 @@ def select_shipping(driver: Driver) -> bool:
         'label[for*="shipping" i]',
     ]
     for selector in candidates:
-        if _click_selector(driver, selector, wait=1) or _js_click(driver, selector):
-            driver.sleep(1.5)
+        if _click_selector(driver, selector, wait=0.35) or _js_click(driver, selector):
+            driver.sleep(0.25)
             return True
-    if _click_text(driver, "Shipping", wait=2):
-        driver.sleep(1.5)
+    if _click_text(driver, "Shipping", wait=0.5):
+        driver.sleep(0.25)
         return True
     return False
 
@@ -531,7 +691,7 @@ def ensure_shipping_address(driver: Driver, address: ShippingAddress) -> None:
 
     for label in ("Save & continue", "Save and continue", "Save", "Use this address"):
         if _click_text(driver, label, wait=0.8):
-            driver.sleep(1.0)
+            driver.sleep(0.35)
             break
 
 
@@ -570,14 +730,16 @@ def step_up_auth_visible(driver: Driver) -> bool:
 
 
 def on_cart_page(driver: Driver) -> bool:
-    url = ""
     try:
         url = (driver.current_url or "").lower()
     except Exception:
-        pass
+        url = ""
     if "/cart" in url:
         return True
-    return driver.select('[data-test="checkout-button"]', 0.4) is not None
+    try:
+        return bool(driver.run_js("return !!document.querySelector('[data-test=\"checkout-button\"]')"))
+    except Exception:
+        return False
 
 
 def on_checkout_page(driver: Driver) -> bool:
@@ -585,30 +747,36 @@ def on_checkout_page(driver: Driver) -> bool:
     if step_up_auth_visible(driver) or _otp_entry_visible(driver):
         return False
 
-    # Cart still showing Check out means we are NOT on the payment review page.
     try:
         url = (driver.current_url or "").lower()
     except Exception:
         url = ""
-    if "/cart" in url and driver.select('[data-test="checkout-button"]', 0.3) is not None:
-        return False
-    if driver.select('[data-test="checkout-button"]', 0.3) is not None and "/checkout" not in url:
-        return False
 
-    has_place = driver.select('[data-test="placeOrderButton"]', 0.5) is not None
-    has_cvv = (
-        driver.select('input[autocomplete="cc-csc"]', 0.3) is not None
-        or driver.select('input[name*="cvv" i]', 0.3) is not None
-        or driver.select('input[data-test*="cvv" i]', 0.3) is not None
-        or driver.select('input[aria-label*="security code" i]', 0.3) is not None
-    )
-    if has_place or has_cvv:
+    try:
+        state = driver.run_js(
+            """
+            const checkoutBtn = !!document.querySelector('[data-test="checkout-button"]');
+            const place = !!document.querySelector('[data-test="placeOrderButton"]');
+            const cvv = !!(
+              document.querySelector('input[autocomplete="cc-csc"]')
+              || document.querySelector('input[name*="cvv" i]')
+              || document.querySelector('input[aria-label*="security code" i]')
+            );
+            return {checkoutBtn, place, cvv};
+            """
+        ) or {}
+    except Exception:
+        state = {}
+
+    if "/cart" in url and state.get("checkoutBtn"):
+        return False
+    if state.get("checkoutBtn") and "/checkout" not in url:
+        return False
+    if state.get("place") or state.get("cvv"):
         return True
-
-    # Soft signal: /checkout URL with Place order copy (not the cart Check out button).
     if "/checkout" in url:
         text = _page_lower(driver)
-        if "place order" in text and "check out" not in text[:500]:
+        if "place order" in text:
             return True
         if "payment" in text and ("cvv" in text or "security code" in text or "ending in" in text):
             return True
@@ -616,52 +784,62 @@ def on_checkout_page(driver: Driver) -> bool:
 
 
 def click_checkout_button(driver: Driver) -> bool:
-    """Click the cart Check out button (JS click — overlays often intercept)."""
+    """Spam Check out until auth modal or checkout page appears."""
     disable_webauthn_prompts(driver)
-    for selector in (
-        '[data-test="checkout-button"]',
-        '[data-test="checkout-button-bottom"]',
-        'button[data-test*="checkout" i]',
-    ):
-        if _js_click(driver, selector) or _click_selector(driver, selector, wait=1.0):
-            driver.sleep(2.0)
-            disable_webauthn_prompts(driver)
-            return True
-    if _click_text(driver, "Check out", wait=2) or _click_text(driver, "Checkout", wait=1):
-        driver.sleep(2.0)
+
+    def _action() -> bool:
         disable_webauthn_prompts(driver)
-        return True
-    return False
+        for selector in (
+            '[data-test="checkout-button"]',
+            '[data-test="checkout-button-bottom"]',
+            'button[data-test*="checkout" i]',
+        ):
+            if _human_click_selector(driver, selector) or _js_click(driver, selector):
+                return True
+        return _click_text(driver, "Check out", wait=0.2) or _click_text(
+            driver, "Checkout", wait=0.15
+        )
+
+    def _ok() -> bool:
+        return on_checkout_page(driver) or step_up_auth_visible(driver) or _otp_entry_visible(driver)
+
+    return _spam_until(
+        driver,
+        action=_action,
+        success=_ok,
+        label="Check out",
+        max_tries=16,
+        peek_lo=0.05,
+        peek_hi=0.12,
+    )
 
 
-def ensure_reached_checkout(driver: Driver, *, attempts: int = 4) -> bool:
+def ensure_reached_checkout(driver: Driver, *, attempts: int = 8) -> bool:
     """After auth, force navigation onto the real checkout page if still on cart."""
     for i in range(1, attempts + 1):
         if on_checkout_page(driver):
             return True
 
-        if step_up_auth_visible(driver):
+        if step_up_auth_visible(driver) or _otp_entry_visible(driver):
             return False
 
-        print(f"[CHECKOUT] not on checkout yet (attempt {i}/{attempts}) — clicking Check out")
+        print(f"[CHECKOUT] not on checkout yet (attempt {i}/{attempts}) — spam Check out")
         if on_cart_page(driver) or "cart" in (driver.current_url or ""):
             click_checkout_button(driver)
         else:
-            # Lost — go cart then checkout
             driver.get("https://www.target.com/cart")
-            driver.sleep(2.0)
+            _human_pause(driver, 0.15, 0.3)
             click_checkout_button(driver)
 
-        # Hard navigation fallback
         if not on_checkout_page(driver) and not step_up_auth_visible(driver):
             driver.get("https://www.target.com/checkout")
-            driver.sleep(2.5)
+            _human_pause(driver, 0.2, 0.4)
 
         if on_checkout_page(driver):
             print("[CHECKOUT] reached checkout page")
             return True
 
-        if step_up_auth_visible(driver):
+        if step_up_auth_visible(driver) or _otp_entry_visible(driver):
             print("[CHECKOUT] sign-in modal returned after Check out click")
             return False
 
@@ -720,7 +898,7 @@ def _click_visible_button_text(driver: Driver, labels: tuple[str, ...]) -> str |
     except Exception:
         matched = None
     if matched:
-        driver.sleep(1.0)
+        driver.sleep(0.35)
         return str(matched)
     for label in labels:
         if _click_text(driver, label, wait=0.6):
@@ -729,8 +907,37 @@ def _click_visible_button_text(driver: Driver, labels: tuple[str, ...]) -> str |
 
 
 def _target_auth_error_visible(driver: Driver) -> bool:
-    text = _page_lower(driver)
-    return "something went wrong on our end" in text or "try again later or send a report" in text
+    """True only for a visible Target error in the sign-in drawer.
+
+    Avoid false positives from hidden/stale page text — those made us keep
+    re-clicking Get a code after the OTP entry screen was already up.
+    """
+    try:
+        return bool(
+            driver.run_js(
+                """
+                const dialog = document.querySelector(
+                  '[role="dialog"], .ReactModal__Content, .ModalDrawer .ReactModal__Content'
+                );
+                const root = dialog || document.body;
+                const nodes = Array.from(root.querySelectorAll('div, p, span, h1, h2, h3, section'));
+                for (const el of nodes) {
+                  const text = ((el.innerText || '') + '').replace(/\\s+/g, ' ').trim();
+                  if (!text || text.length > 220) continue;
+                  if (!/something went wrong on our end/i.test(text)) continue;
+                  const style = window.getComputedStyle(el);
+                  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+                  const r = el.getBoundingClientRect();
+                  if (r.width < 8 || r.height < 8) continue;
+                  return true;
+                }
+                return false;
+                """
+            )
+        )
+    except Exception:
+        text = _page_lower(driver)
+        return "something went wrong on our end" in text and "get a code" in text
 
 
 def _otp_copy_visible(driver: Driver) -> bool:
@@ -750,7 +957,78 @@ def _otp_copy_visible(driver: Driver) -> bool:
 
 
 def _otp_entry_visible(driver: Driver) -> bool:
-    return _otp_copy_visible(driver) or _find_otp_input(driver) is not None
+    """Instant — JS only. Never use driver.select waits here (spam loops call this)."""
+    try:
+        return bool(
+            driver.run_js(
+                """
+                const text = ((document.body && document.body.innerText) || '').toLowerCase();
+                const copy = (
+                  text.includes('enter your code')
+                  || text.includes("we've sent your code")
+                  || text.includes("you've got mail")
+                  || text.includes('keep this browser tab open to enter your code')
+                  || text.includes('verification code')
+                  || text.includes('6-digit')
+                );
+                if (copy) return true;
+                const inputs = Array.from(document.querySelectorAll(
+                  'input[autocomplete="one-time-code"], input[placeholder*="code" i], input[name*="otp" i], input[name*="code" i], input[inputmode="numeric"]'
+                ));
+                for (const el of inputs) {
+                  const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+                  const name = (el.name || '').toLowerCase();
+                  const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
+                  const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                  const blob = ph + ' ' + name + ' ' + ac + ' ' + aria;
+                  if (blob.includes('search') || name.includes('email') || blob.includes('password')) continue;
+                  if (ac === 'one-time-code' || /otp|code|passcode/.test(blob)) return true;
+                }
+                return false;
+                """
+            )
+        )
+    except Exception:
+        return _otp_copy_visible(driver)
+
+
+def _find_otp_input(driver: Driver):
+    """Return a CSS selector for the OTP field via one JS pass (no waits)."""
+    try:
+        return driver.run_js(
+            """
+            const candidates = [
+              'input[autocomplete="one-time-code"]',
+              'input[placeholder*="Enter your code" i]',
+              'input[placeholder*="code" i]',
+              'input[name*="otp" i]',
+              'input[name*="code" i]',
+              'input[data-test*="otp" i]',
+              'input[data-test*="code" i]',
+              'input[inputmode="numeric"]',
+              'input[type="tel"]',
+            ];
+            for (const sel of candidates) {
+              let el = null;
+              try { el = document.querySelector(sel); } catch (e) { continue; }
+              if (!el) continue;
+              const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+              const name = (el.name || '').toLowerCase();
+              const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
+              const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+              const blob = ph + ' ' + name + ' ' + ac + ' ' + aria;
+              if (blob.includes('search') || name.includes('email') || blob.includes('password')) continue;
+              if (ac === 'one-time-code' || /otp|code|passcode|one-time/.test(blob)) return sel;
+              if (sel === 'input[inputmode="numeric"]' || sel === 'input[type="tel"]') {
+                const text = ((document.body && document.body.innerText) || '').toLowerCase();
+                if (text.includes('enter your code') || text.includes('verification code')) return sel;
+              }
+            }
+            return null;
+            """
+        )
+    except Exception:
+        return None
 
 
 def _auth_method_chooser_visible(driver: Driver) -> bool:
@@ -801,226 +1079,216 @@ def disable_webauthn_prompts(driver: Driver) -> None:
 
 
 def _activate_role_button(driver: Driver, el_selector: str) -> bool:
-    """Click a Target NDS role=button cell (e.g. #otp) — click only, never #passkey."""
+    """Human-ish click on a Target NDS role=button cell — never #passkey."""
     if "passkey" in el_selector.lower():
         print(f"[AUTH] refused to activate passkey selector {el_selector!r}")
         return False
-    try:
-        result = driver.run_js(
-            f"""
-            const el = document.querySelector({el_selector!r});
-            if (!el) return {{ok: false, reason: 'missing'}};
-            if ((el.id || '').toLowerCase() === 'passkey') return {{ok: false, reason: 'passkey-blocked'}};
-            if (el.getAttribute('aria-disabled') === 'true') return {{ok: false, reason: 'disabled'}};
-            el.scrollIntoView({{block: 'center', inline: 'center'}});
-            const r = el.getBoundingClientRect();
-            const x = r.left + r.width / 2;
-            const y = r.top + r.height / 2;
-            const base = {{bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0}};
-            for (const type of ['pointerover','mouseover','pointerdown','mousedown','pointerup','mouseup','click']) {{
-              let ev;
-              if (type.indexOf('pointer') === 0) {{
-                ev = new PointerEvent(type, Object.assign({{}}, base, {{pointerId: 1, pointerType: 'mouse', isPrimary: true}}));
-              }} else {{
-                ev = new MouseEvent(type, base);
-              }}
-              el.dispatchEvent(ev);
-            }}
-            try {{ el.click(); }} catch (e) {{}}
-            return {{
-              ok: true,
-              id: el.id || '',
-              role: el.getAttribute('role') || '',
-              text: ((el.innerText || '') + '').replace(/\\s+/g, ' ').trim().slice(0, 80),
-            }};
-            """
-        )
-    except Exception as exc:
-        print(f"[AUTH] activate {el_selector!r} failed: {exc}")
-        return False
-    if isinstance(result, dict) and result.get("ok"):
-        print(f"[AUTH] activated {el_selector!r} → {result.get('text')!r}")
-        driver.sleep(1.2)
-        return True
-    return False
+    ok = _human_click_selector(driver, el_selector)
+    if ok:
+        print(f"[AUTH] activated {el_selector!r}")
+    return ok
 
 
 def click_get_a_code_button(driver: Driver) -> bool:
-    """Click Target's step-up 'Get a code' control.
-
-    Live DOM (ModalDrawer sign-in sheet):
-      <div id="otp" role="button" class="... styles_authMethodCell__tLZWs" tabindex="0">
-        <span class="styles_ndsCellPrimaryText__...">Get a code</span>
-      </div>
-    Passkey sibling is #passkey — never click it (opens OS WebAuthn sheet).
-    """
-    disable_webauthn_prompts(driver)
-    # Ensure #passkey is not focused / not clickable via text fallbacks.
+    """One fast human click on #otp — never #passkey. No select waits."""
     try:
-        driver.run_js(
-            """
+        result = driver.run_js(
+            f"""
             const pk = document.querySelector('#passkey');
-            if (pk) {
+            if (pk) {{
               pk.setAttribute('aria-disabled', 'true');
               pk.style.pointerEvents = 'none';
-            }
-            return !!pk;
+            }}
+            let el = document.querySelector('#otp[role="button"]')
+              || document.querySelector('#otp')
+              || document.querySelector('[role="dialog"] #otp');
+            if (!el) {{
+              const nodes = Array.from(document.querySelectorAll('[role="button"], button'));
+              for (const n of nodes) {{
+                if ((n.id || '').toLowerCase() === 'passkey') continue;
+                const t = ((n.innerText || '') + '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                if (t === 'get a code' || t.startsWith('get a code')) {{ el = n; break; }}
+              }}
+            }}
+            if (!el) return {{ok: false}};
+            el.removeAttribute('aria-disabled');
+            el.style.pointerEvents = 'auto';
+            el.scrollIntoView({{block: 'center', inline: 'nearest'}});
+            try {{ el.focus({{preventScroll: true}}); }} catch (e) {{}}
+            const r = el.getBoundingClientRect();
+            const x = r.left + r.width * (0.4 + Math.random() * 0.2);
+            const y = r.top + r.height * (0.4 + Math.random() * 0.2);
+            const opts = (buttons) => ({{
+              bubbles: true, cancelable: true, view: window,
+              clientX: x, clientY: y, button: 0, buttons,
+              pointerId: 1, pointerType: 'mouse', isPrimary: true,
+            }});
+            el.dispatchEvent(new PointerEvent('pointerdown', opts(1)));
+            el.dispatchEvent(new MouseEvent('mousedown', opts(1)));
+            el.dispatchEvent(new PointerEvent('pointerup', opts(0)));
+            el.dispatchEvent(new MouseEvent('mouseup', opts(0)));
+            el.dispatchEvent(new MouseEvent('click', opts(0)));
+            try {{ el.click(); }} catch (e) {{}}
+            return {{ok: true, id: el.id || '', text: ((el.innerText || '') + '').replace(/\\s+/g, ' ').trim().slice(0, 40)}};
             """
         )
-    except Exception:
-        pass
-
-    for selector in (
-        '#otp[role="button"]',
-        "#otp",
-        '[id="otp"]',
-        'div.styles_authMethodCell__tLZWs#otp',
-        '[role="dialog"] #otp',
-        '.ReactModal__Content #otp',
-        '.ModalDrawer #otp',
-    ):
-        if _activate_role_button(driver, selector):
-            return True
-
-    # Fallback: find role=button whose primary text is exactly Get a code.
-    try:
-        found = driver.run_js(
-            """
-            const nodes = Array.from(document.querySelectorAll('[role="button"], button, a'));
-            for (const el of nodes) {
-              if ((el.id || '').toLowerCase() === 'passkey') continue;
-              const primary = el.querySelector('.styles_ndsCellPrimaryText__7IkfY, [class*="PrimaryText"]');
-              const text = ((primary && primary.innerText) || el.innerText || '')
-                .replace(/\\s+/g, ' ').trim().toLowerCase();
-              if (text === 'get a code' || (text.startsWith('get a code') && !text.includes('passkey'))) {
-                if ((el.id || '').toLowerCase() === 'otp' || text === 'get a code') {
-                  el.scrollIntoView({block: 'center'});
-                  el.click();
-                  return el.id || text;
-                }
-              }
-            }
-            return null;
-            """
-        )
-    except Exception:
-        found = None
-    if found:
-        print(f"[AUTH] clicked Get a code via role=button scan → {found!r}")
-        driver.sleep(1.2)
-        return True
-
-    if _click_text(driver, "Get a code", wait=1.5):
-        print("[AUTH] clicked Get a code via text fallback")
+    except Exception as exc:
+        print(f"[AUTH] Get a code click failed: {exc}")
+        return False
+    if isinstance(result, dict) and result.get("ok"):
         return True
     return False
 
 
 def request_email_code(driver: Driver, *, force_new: bool = False) -> bool:
-    """Click Get a code / Resend on the Target step-up modal.
-
-    Success means the code-entry UI appeared (or resend was clicked while
-    already there). Target sometimes shows "Something went wrong on our end"
-    on the chooser — we still click Get a code and retry until entry shows.
-    """
+    """Spam-click Get a code with human jitter until OTP entry appears."""
+    disable_webauthn_prompts(driver)
     if _otp_entry_visible(driver) and not force_new:
         print("[AUTH] OTP entry already visible")
         return True
 
     if _target_auth_error_visible(driver):
-        print("[AUTH] Target error banner visible — retrying Get a code")
+        print("[AUTH] error banner — ignoring, spam-clicking Get a code")
 
-    for attempt in range(1, 4):
-        if _otp_entry_visible(driver) and force_new:
-            # Already on entry screen — look for Resend / Didn't get a code?
+    def _ok() -> bool:
+        return _otp_entry_visible(driver)
+
+    if force_new and _ok():
+        for _ in range(6):
             clicked = _click_visible_button_text(
                 driver,
                 ("resend", "send a new code", "didn't get a code?", "get a new code"),
             )
             if clicked:
-                print(f"[AUTH] clicked resend: {clicked!r} (attempt {attempt})")
-                driver.sleep(2.0)
+                print(f"[AUTH] clicked resend: {clicked!r}")
+                _human_pause(driver, 0.08, 0.18)
                 return True
-            # Fall through to #otp in case Target bounced back to chooser.
+            if not _auth_method_chooser_visible(driver) and _ok():
+                break
+            click_get_a_code_button(driver)
+            _human_pause(driver, 0.05, 0.1)
 
-        clicked = click_get_a_code_button(driver)
-        if not clicked:
-            print(f"[AUTH] Get a code control not found (attempt {attempt})")
-        driver.sleep(2.0)
-
-        if _otp_entry_visible(driver):
-            print("[AUTH] code entry screen is up")
-            return True
-        if force_new and clicked:
-            return True
-        if _target_auth_error_visible(driver):
-            print("[AUTH] still seeing Target 'something went wrong' — waiting then retry")
-            driver.sleep(2.5)
-            continue
-        if _auth_method_chooser_visible(driver):
-            print("[AUTH] still on passkey/Get a code chooser — retrying")
-            driver.sleep(1.5)
-            continue
-        break
-
-    return _otp_entry_visible(driver)
-
-def _find_otp_input(driver: Driver):
-    selectors = [
-        'input[placeholder*="Enter your code" i]',
-        'input[placeholder*="code" i]',
-        'input[autocomplete="one-time-code"]',
-        'input[name*="otp" i]',
-        'input[name*="code" i]',
-        'input[data-test*="otp" i]',
-        'input[data-test*="code" i]',
-        'input[inputmode="numeric"]',
-        'input[type="tel"]',
-        'input[type="text"]',
-    ]
-    for selector in selectors:
-        el = driver.select(selector, 0.6)
-        if el is None:
-            continue
-        try:
-            placeholder = (el.get_attribute("placeholder") or "").lower()
-            name = (el.get_attribute("name") or "").lower()
-            autocomplete = (el.get_attribute("autocomplete") or "").lower()
-            aria = (el.get_attribute("aria-label") or "").lower()
-            blob = f"{placeholder} {name} {autocomplete} {aria}"
-            if "search" in blob or "email" in name or "password" in blob:
-                continue
-            if selector in {'input[type="text"]', 'input[type="tel"]', 'input[inputmode="numeric"]'}:
-                if not any(k in blob for k in ("code", "otp", "passcode", "one-time")):
-                    # Only accept bare tel/text inputs when OTP copy is on-screen.
-                    if not _otp_copy_visible(driver) and "one-time-code" not in autocomplete:
-                        continue
-        except Exception:
-            pass
-        return selector
-    return None
+    return _spam_until(
+        driver,
+        action=click_get_a_code_button,
+        success=_ok,
+        label="Get a code",
+        max_tries=40,
+        peek_lo=0.04,
+        peek_hi=0.1,
+    )
 
 
-def submit_otp(driver: Driver, code: str) -> bool:
+def _paste_into_selector(driver: Driver, selector: str, value: str) -> bool:
+    """Paste a value in one shot (insertFromPaste) instead of key-by-key typing."""
+    if not value or not selector:
+        return False
+    try:
+        ok = driver.run_js(
+            f"""
+            const el = document.querySelector({selector!r});
+            if (!el) return false;
+            el.focus({{preventScroll: true}});
+            try {{ el.select(); }} catch (e) {{}}
+            el.value = '';
+            el.dispatchEvent(new Event('input', {{bubbles: true}}));
+            const text = {value!r};
+            // Prefer native value setter so React controlled inputs update.
+            const proto = window.HTMLInputElement && window.HTMLInputElement.prototype;
+            const desc = proto && Object.getOwnPropertyDescriptor(proto, 'value');
+            if (desc && desc.set) {{
+              desc.set.call(el, text);
+            }} else {{
+              el.value = text;
+            }}
+            try {{
+              el.dispatchEvent(new InputEvent('input', {{
+                bubbles: true,
+                cancelable: true,
+                inputType: 'insertFromPaste',
+                data: text,
+              }}));
+            }} catch (e) {{
+              el.dispatchEvent(new Event('input', {{bubbles: true}}));
+            }}
+            el.dispatchEvent(new Event('change', {{bubbles: true}}));
+            try {{
+              el.dispatchEvent(new ClipboardEvent('paste', {{bubbles: true, cancelable: true}}));
+            }} catch (e) {{}}
+            return (el.value || '') === text || (el.value || '').includes(text);
+            """
+        )
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def _click_verify_button(driver: Driver) -> bool:
+    if _click_visible_button_text(driver, ("verify", "continue", "submit")):
+        return True
+    return _click_text(driver, "Verify", wait=0.35)
+
+
+def submit_otp(driver: Driver, code: str, *, max_verify_tries: int = 20) -> bool:
+    """Paste the emailed code and spam Verify until Target accepts it."""
+    code = (code or "").strip()
+    if len(code) < 4:
+        return False
+
     selector = _find_otp_input(driver)
     if not selector:
-        request_email_code(driver)
+        request_email_code(driver, force_new=False)
         selector = _find_otp_input(driver)
         if not selector:
             return False
-    try:
-        driver.clear(selector)
-    except Exception:
-        pass
-    driver.type(selector, code)
-    driver.sleep(0.4)
-    if _click_visible_button_text(driver, ("verify", "continue", "submit")):
-        driver.sleep(2.5)
-        return not step_up_auth_visible(driver) and _find_otp_input(driver) is None
-    if _click_text(driver, "Verify", wait=1.5):
-        driver.sleep(2.5)
-        return not step_up_auth_visible(driver)
-    return False
+
+    def _accepted() -> bool:
+        if on_checkout_page(driver):
+            return True
+        if not step_up_auth_visible(driver) and _find_otp_input(driver) is None:
+            return True
+        if not step_up_auth_visible(driver) and not _otp_entry_visible(driver):
+            return True
+        return False
+
+    for attempt in range(1, max_verify_tries + 1):
+        if _accepted():
+            return True
+
+        selector = _find_otp_input(driver) or selector
+        pasted = _paste_into_selector(driver, selector, code)
+        if not pasted:
+            try:
+                driver.clear(selector)
+            except Exception:
+                pass
+            try:
+                if not _paste_into_selector(driver, selector, code):
+                    driver.type(selector, code)
+                    pasted = True
+            except Exception:
+                print(f"[AUTH] could not paste OTP (attempt {attempt})")
+                _human_pause(driver, 0.06, 0.12)
+                continue
+        if pasted:
+            print(f"[AUTH] pasted OTP + Verify ({attempt}/{max_verify_tries})")
+
+        _human_pause(driver, 0.05, 0.12)
+        if not _click_verify_button(driver):
+            _click_text(driver, "Verify", wait=0.12)
+            _human_pause(driver, 0.05, 0.1)
+
+        peek_until = time.time() + random.uniform(0.25, 0.45)
+        while time.time() < peek_until:
+            if _accepted():
+                return True
+            driver.sleep(0.05)
+
+        if _target_auth_error_visible(driver):
+            print("[AUTH] error on code entry — spam Verify again")
+        _human_pause(driver, 0.06, 0.14)
+
+    return _accepted()
 
 
 def wait_for_checkout_auth(driver: Driver, *, timeout_seconds: float) -> bool:
@@ -1062,7 +1330,8 @@ def wait_for_checkout_auth(driver: Driver, *, timeout_seconds: float) -> bool:
     deadline = time.time() + max(5.0, timeout_seconds)
     used_codes: set[str] = set()
     next_gmail_poll = 0.0
-    next_resend = time.time() + 35.0
+    # Give the first email time to arrive before hammering Resend.
+    next_resend = time.time() + 45.0
     otp_accepted = False
     auth_missing_streak = 0
 
@@ -1072,11 +1341,12 @@ def wait_for_checkout_auth(driver: Driver, *, timeout_seconds: float) -> bool:
             print("[AUTH] On checkout page")
             return True
 
-        auth_up = step_up_auth_visible(driver) or _otp_entry_visible(driver)
+        entry_up = _otp_entry_visible(driver)
+        auth_up = step_up_auth_visible(driver) or entry_up
 
         otp = read_target_otp()
         if gmail.is_configured and time.time() >= next_gmail_poll:
-            next_gmail_poll = time.time() + 3.0
+            next_gmail_poll = time.time() + 0.45
             try:
                 gmail_otp = fetch_latest_target_otp(gmail, newer_than=code_requested_at)
             except Exception as exc:
@@ -1088,38 +1358,40 @@ def wait_for_checkout_auth(driver: Driver, *, timeout_seconds: float) -> bool:
 
         if auth_up and otp and len(otp) >= 4 and otp not in used_codes:
             print(f"[AUTH] Submitting OTP ({len(otp)} digits)")
-            used_codes.add(otp)
             if submit_otp(driver, otp):
+                used_codes.add(otp)
                 clear_target_otp()
                 otp_accepted = True
                 print("[AUTH] OTP accepted — opening checkout")
-                driver.sleep(2.0)
+                driver.sleep(0.2)
                 if ensure_reached_checkout(driver):
                     return True
                 if step_up_auth_visible(driver) or _otp_entry_visible(driver):
                     print("[AUTH] Check out re-triggered sign-in — requesting new code")
                     code_requested_at = datetime.now(timezone.utc) - timedelta(seconds=5)
-                    request_email_code(driver, force_new=True)
-                    next_resend = time.time() + 35.0
+                    request_email_code(driver, force_new=False)
+                    next_resend = time.time() + 45.0
                     otp_accepted = False
                 continue
-            print("[AUTH] OTP rejected")
-            code_requested_at = datetime.now(timezone.utc) - timedelta(seconds=5)
-            request_email_code(driver, force_new=True)
-            next_resend = time.time() + 35.0
+            # Same code may still be valid — Target just glitched. Retry Verify
+            # path again shortly without burning the code or forcing Resend.
+            print("[AUTH] OTP not accepted yet — will retry same code")
+            next_resend = min(next_resend, time.time() + 8.0)
+            time.sleep(0.3)
             continue
 
-        if auth_up and time.time() >= next_resend:
-            if _auth_method_chooser_visible(driver) or _target_auth_error_visible(driver):
-                print("[AUTH] chooser/error still up — clicking Get a code again")
-                code_requested_at = datetime.now(timezone.utc) - timedelta(seconds=5)
-                request_email_code(driver, force_new=False)
-            else:
-                print("[AUTH] no fresh OTP yet — resending code")
-                code_requested_at = datetime.now(timezone.utc) - timedelta(seconds=5)
-                if not request_email_code(driver, force_new=True):
-                    request_email_code(driver, force_new=False)
-            next_resend = time.time() + 25.0
+        # OTP entry already up → just wait for Gmail. Do not treat the leftover
+        # "something went wrong" banner as a reason to re-click Get a code.
+        if entry_up and time.time() >= next_resend:
+            print("[AUTH] still waiting for email — resending code once")
+            code_requested_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+            request_email_code(driver, force_new=True)
+            next_resend = time.time() + 45.0
+        elif (not entry_up) and auth_up and time.time() >= next_resend:
+            print("[AUTH] chooser/error still up — spam-clicking Get a code")
+            code_requested_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+            request_email_code(driver, force_new=False)
+            next_resend = time.time() + 1.5
 
         if auth_up:
             auth_missing_streak = 0
@@ -1136,8 +1408,8 @@ def wait_for_checkout_auth(driver: Driver, *, timeout_seconds: float) -> bool:
             if step_up_auth_visible(driver) or _otp_entry_visible(driver):
                 otp_accepted = False
                 code_requested_at = datetime.now(timezone.utc) - timedelta(seconds=5)
-                request_email_code(driver, force_new=True)
-                next_resend = time.time() + 35.0
+                request_email_code(driver, force_new=False)
+                next_resend = time.time() + 45.0
             continue
 
         if auth_missing_streak >= 8 and not otp_accepted:
@@ -1151,9 +1423,9 @@ def wait_for_checkout_auth(driver: Driver, *, timeout_seconds: float) -> bool:
             if step_up_auth_visible(driver) or _otp_entry_visible(driver):
                 code_requested_at = datetime.now(timezone.utc) - timedelta(seconds=5)
                 request_email_code(driver, force_new=False)
-                next_resend = time.time() + 35.0
+                next_resend = time.time() + 45.0
 
-        time.sleep(1.5)
+        time.sleep(0.2)
 
     if otp_accepted:
         return ensure_reached_checkout(driver)
@@ -1168,7 +1440,7 @@ def start_checkout(driver: Driver, *, wait_auth: bool = True, auth_timeout: floa
     # Direct navigation fallback
     if not clicked and not on_checkout_page(driver) and not step_up_auth_visible(driver):
         driver.get("https://www.target.com/checkout")
-        driver.sleep(2.5)
+        driver.sleep(0.55)
         clicked = True
 
     if not wait_auth:
@@ -1199,8 +1471,8 @@ def _open_add_card(driver: Driver) -> None:
         "Payment",
         "Change",
     ):
-        if _click_text(driver, label, wait=0.6):
-            driver.sleep(0.8)
+        if _click_text(driver, label, wait=0.4):
+            driver.sleep(0.3)
             break
 
 
@@ -1260,7 +1532,7 @@ def fill_cvv(driver: Driver, cvv: str) -> bool:
                 text = (el.text or "").strip().lower()
                 if text in {"edit", "enter cvv", "security code", "cvv"} or "cvv" in text:
                     el.click()
-                    driver.sleep(0.6)
+                    driver.sleep(0.25)
         except Exception:
             pass
 
@@ -1277,7 +1549,7 @@ def fill_cvv(driver: Driver, cvv: str) -> bool:
         'input[id*="cvv" i]',
         'input[id*="csc" i]',
     ]
-    if _type_first(driver, selectors, cvv, wait=1.5):
+    if _type_first(driver, selectors, cvv, wait=0.6):
         return True
 
     # Card fields are often inside payment iframes.
@@ -1370,15 +1642,15 @@ def fill_payment(driver: Driver, payment: PaymentInfo) -> bool:
         return False
 
     # Wait briefly for checkout payment widgets to hydrate.
-    for _ in range(6):
+    for _ in range(8):
         if (
-            driver.select('[data-test="placeOrderButton"]', 0.4) is not None
+            driver.select('[data-test="placeOrderButton"]', 0.25) is not None
             or "cvv" in _page_lower(driver)
             or "security code" in _page_lower(driver)
             or "ending in" in _page_lower(driver)
         ):
             break
-        driver.sleep(1.0)
+        driver.sleep(0.35)
 
     # Saved-card path: Target usually only asks for CVV.
     if payment.use_saved_card:
@@ -1386,7 +1658,7 @@ def fill_payment(driver: Driver, payment: PaymentInfo) -> bool:
             if fill_cvv(driver, payment.card_cvv):
                 print(f"[PAYMENT] CVV filled (attempt {attempt})")
                 return True
-            driver.sleep(1.0)
+            driver.sleep(0.4)
         page = _page_lower(driver)
         if "ending in" in page or "card ending" in page or "visa" in page or "mastercard" in page:
             if "cvv" not in page and "security code" not in page:
@@ -1437,19 +1709,23 @@ def fill_new_card(driver: Driver, payment: PaymentInfo) -> bool:
     ):
         filled += 1
 
-    # Combined expiry MM/YY field
-    if payment.card_expiration_date and _type_first(
+    # Combined expiry — Target #credit-card-expiration-input is maxlength=5 (MM/YY).
+    exp_value = payment.expiration_mm_yy
+    if exp_value and _type_first(
         driver,
         [
+            "#credit-card-expiration-input",
+            'input[name="credit-card-expiration-input"]',
             'input[autocomplete="cc-exp"]',
             'input[name*="expir" i]',
             'input[aria-label*="expir" i]',
             'input[placeholder*="MM" i]',
         ],
-        payment.card_expiration_date,
+        exp_value,
         wait=1.0,
     ):
         filled += 1
+        print(f"[PAYMENT] typed expiry {exp_value!r} (from env {payment.card_expiration_date!r})")
     else:
         # Separate month / year selects or inputs
         if month and _type_first(
@@ -1463,14 +1739,15 @@ def fill_new_card(driver: Driver, payment: PaymentInfo) -> bool:
             wait=0.8,
         ):
             filled += 1
-        if year and _type_first(
+        yy = year[-2:] if year else ""
+        if yy and _type_first(
             driver,
             [
                 'select[name*="expir" i][name*="year" i]',
                 'select[autocomplete="cc-exp-year"]',
                 'input[name*="expYear" i]',
             ],
-            year,
+            yy,
             wait=0.8,
         ):
             filled += 1
@@ -1490,11 +1767,11 @@ def place_order(driver: Driver) -> bool:
         'button[data-test*="placeOrder" i]',
         'button[data-test*="place-order" i]',
     ):
-        if _js_click(driver, selector) or _click_selector(driver, selector, wait=2):
-            driver.sleep(3.0)
+        if _js_click(driver, selector) or _click_selector(driver, selector, wait=0.5):
+            driver.sleep(0.45)
             return True
-    return _click_text(driver, "Place order", wait=2) or _click_text(
-        driver, "Place my order", wait=1
+    return _click_text(driver, "Place order", wait=0.7) or _click_text(
+        driver, "Place my order", wait=0.4
     )
 
 
@@ -1531,7 +1808,7 @@ def order_confirmation(driver: Driver) -> tuple[bool, str | None]:
 def choose_fulfillment_and_checkout(driver: Driver, config: AppConfig) -> CheckoutResult:
     login_hint = ensure_logged_in_hint(driver)
     go_to_cart(driver)
-    driver.sleep(1.5)
+    driver.sleep(0.2)
 
     if cart_is_empty(driver):
         return CheckoutResult(
@@ -1549,10 +1826,29 @@ def choose_fulfillment_and_checkout(driver: Driver, config: AppConfig) -> Checko
     if cart_line_count(driver) > 1:
         trim_cart_to_max_lines(driver, max_lines=1)
 
-    if config.prefer_pickup or shipping_blocked_by_minimum(driver):
+    already_pickup = False
+    try:
+        already_pickup = bool(
+            driver.run_js(
+                """
+                const checked = document.querySelector('input[value="STORE_PICKUP"]:checked');
+                if (checked) return true;
+                const text = (document.body && document.body.innerText || '').toLowerCase();
+                return /order pickup/.test(text) && /ready within|pick up at/.test(text)
+                  && !/only ship with \\$35/.test(text);
+                """
+            )
+        )
+    except Exception:
+        already_pickup = False
+
+    if already_pickup and not shipping_blocked_by_minimum(driver):
+        fulfillment = FulfillmentChoice.PICKUP
+        select_preferred_store(driver, config.preferred_store_name)
+    elif config.prefer_pickup or shipping_blocked_by_minimum(driver):
         if switch_cart_to_pickup(driver, config.preferred_store_name):
             fulfillment = FulfillmentChoice.PICKUP
-            driver.sleep(1.0)
+            driver.sleep(0.18)
             if cart_line_count(driver) > 1:
                 trim_cart_to_max_lines(driver, max_lines=1)
             if cart_is_empty(driver):
@@ -1570,7 +1866,7 @@ def choose_fulfillment_and_checkout(driver: Driver, config: AppConfig) -> Checko
     if fulfillment != FulfillmentChoice.PICKUP and config.prefer_pickup and pickup_available(driver):
         if select_pickup(driver, config.preferred_store_name):
             fulfillment = FulfillmentChoice.PICKUP
-            driver.sleep(1.0)
+            driver.sleep(0.18)
 
     if fulfillment != FulfillmentChoice.PICKUP:
         # Do not force shipping when Target says the cart can't ship yet.
@@ -1587,7 +1883,7 @@ def choose_fulfillment_and_checkout(driver: Driver, config: AppConfig) -> Checko
         elif select_shipping(driver):
             fulfillment = FulfillmentChoice.SHIPPING
             ensure_shipping_address(driver, config.shipping_address)
-            driver.sleep(1.0)
+            driver.sleep(0.18)
             if shipping_blocked_by_minimum(driver):
                 if switch_cart_to_pickup(driver, config.preferred_store_name):
                     fulfillment = FulfillmentChoice.PICKUP
@@ -1608,10 +1904,9 @@ def choose_fulfillment_and_checkout(driver: Driver, config: AppConfig) -> Checko
         elif pickup_available(driver) and select_pickup(driver, config.preferred_store_name):
             fulfillment = FulfillmentChoice.PICKUP
 
-    # Dry-runs should not block for minutes on Face ID / email OTP.
+    # Always allow the configured auth window — Gmail OTP needs real time.
+    # Dry-run / no-place-order still stops before Place order below.
     auth_timeout = config.checkout_auth_timeout_seconds
-    if config.dry_run or not config.place_order:
-        auth_timeout = min(auth_timeout, 8.0)
 
     if not start_checkout(
         driver,
@@ -1625,8 +1920,7 @@ def choose_fulfillment_and_checkout(driver: Driver, config: AppConfig) -> Checko
                 placed_order=False,
                 message=(
                     "Dry run stop at Target checkout sign-in "
-                    "(passkey / emailed code). For real buys use --place-order "
-                    "and complete Face ID or set TARGET_OTP while waiting."
+                    "(passkey / emailed code). Sign-in did not complete in time."
                 ),
             )
         msg = "Could not start checkout (sign-in step-up timed out or checkout blocked)"

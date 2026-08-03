@@ -212,7 +212,7 @@ def wait_for_gmail_otp(
     *,
     newer_than: datetime,
     timeout_seconds: float = 90.0,
-    poll_seconds: float = 3.0,
+    poll_seconds: float = 1.5,
     creds: GmailCredentials | None = None,
 ) -> str | None:
     """Poll Gmail until a fresh Target OTP appears or timeout."""

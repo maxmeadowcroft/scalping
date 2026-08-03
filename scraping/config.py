@@ -98,6 +98,22 @@ class PaymentInfo:
             return digits[:2], digits[2:]
         return raw, ""
 
+    @property
+    def expiration_mm_yy(self) -> str:
+        """Target's card exp field is maxlength=5 (MM/YY).
+
+        Env may store the full year (`11/2030`); typing that into Target becomes
+        `11/20` (first 5 chars) which fails validation. Always send MM/YY.
+        """
+        month, year = self.expiration_month_year
+        month_digits = re.sub(r"\D", "", month).zfill(2)[-2:]
+        year_digits = re.sub(r"\D", "", year)
+        if len(year_digits) >= 2:
+            year_digits = year_digits[-2:]
+        if month_digits and year_digits:
+            return f"{month_digits}/{year_digits}"
+        return self.card_expiration_date.strip()
+
 
 @dataclass(frozen=True)
 class ItemConfig:
@@ -132,6 +148,8 @@ class AppConfig:
     preferred_store_name: str = "Albuquerque Wyoming"
     max_atc_retries: int = 3
     checkout_auth_timeout_seconds: float = 300.0
+    # None = auto: parallel when 2+ enabled items
+    parallel: bool | None = None
     shipping_address: ShippingAddress = field(
         default_factory=lambda: ShippingAddress(
             name="",
@@ -150,6 +168,11 @@ class AppConfig:
     @property
     def enabled_items(self) -> list[ItemConfig]:
         return [item for item in self.items if item.enabled]
+
+    def use_parallel(self) -> bool:
+        if self.parallel is not None:
+            return bool(self.parallel) and len(self.enabled_items) > 1
+        return len(self.enabled_items) > 1
 
     def with_place_order(self, enabled: bool = True) -> AppConfig:
         return replace(self, dry_run=not enabled, place_order=enabled)
@@ -254,6 +277,13 @@ def load_config(path: Path | None = None) -> AppConfig:
         or raw.get("checkout_auth_timeout_seconds", 300)
     )
 
+    parallel_raw = raw.get("parallel", None)
+    parallel: bool | None
+    if parallel_raw is None:
+        parallel = None
+    else:
+        parallel = bool(parallel_raw)
+
     return AppConfig(
         items=items,
         refresh_interval_seconds=float(raw.get("refresh_interval_seconds", 5)),
@@ -266,6 +296,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         ),
         max_atc_retries=int(raw.get("max_atc_retries", 3)),
         checkout_auth_timeout_seconds=auth_timeout,
+        parallel=parallel,
         shipping_address=shipping,
         payment=load_payment_from_env(),
     )

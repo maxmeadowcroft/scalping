@@ -1,12 +1,13 @@
 {
-  "refresh_interval_seconds": 5,
-  "refresh_jitter_seconds": 1.5,
+  "refresh_interval_seconds": 0.4,
+  "refresh_jitter_seconds": 0.15,
   "max_atc_retries": 3,
   "dry_run": true,
   "place_order": false,
   "prefer_pickup": true,
   "preferred_store_name": "Albuquerque Wyoming",
   "checkout_auth_timeout_seconds": 300,
+  "parallel": true,
   "shipping_address": {
     "name": "",
     "street": "3604 Garcia St NE",

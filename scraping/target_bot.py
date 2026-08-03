@@ -20,7 +20,7 @@ import argparse
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from botasaurus.browser import Driver, browser
@@ -36,8 +36,10 @@ from scraping.runtime import (
 from scraping.target_checkout import (
     CheckoutResult,
     cart_has_items,
+    cart_line_count,
     choose_fulfillment_and_checkout,
     clear_cart,
+    open_cart_after_atc,
     trim_cart_to_max_lines,
 )
 from scraping.target_stock import (
@@ -62,7 +64,7 @@ class ItemRunResult:
 
 
 def _sleep_poll(config: AppConfig) -> None:
-    base = max(0.5, float(config.refresh_interval_seconds))
+    base = max(0.25, float(config.refresh_interval_seconds))
     jitter = max(0.0, float(config.refresh_jitter_seconds))
     delay = base + (random.uniform(0, jitter) if jitter else 0.0)
     time.sleep(delay)
@@ -82,23 +84,27 @@ def _attempt_purchase(driver: Driver, item: ItemConfig, config: AppConfig) -> It
     print(f"[IN STOCK] {item.label} ({item.tcin}) — adding to cart")
     atc_ok = False
     for attempt in range(1, config.max_atc_retries + 1):
-        # Never ATC on top of an existing cart — that creates ship+pickup twins.
-        try:
-            clear_cart(driver)
-        except Exception as exc:
-            print(f"[CART] pre-ATC clear skipped: {exc}")
-        open_product(driver, item, force_navigate=True)
-        driver.sleep(1.0)
+        # Clear only on retries (monitor already cleared once up front).
+        if attempt > 1:
+            try:
+                clear_cart(driver)
+            except Exception as exc:
+                print(f"[CART] pre-ATC clear skipped: {exc}")
+            open_product(driver, item, force_navigate=True)
+            driver.sleep(0.2)
         if add_to_cart(driver, item, prefer_pickup=config.prefer_pickup):
             dismiss_post_atc_modals(driver)
-            driver.sleep(2.5)  # let Target cart sync before we verify
-            if cart_has_items(driver):
-                trim_cart_to_max_lines(driver, max_lines=1)
+            # Jump straight to cart via the drawer CTA — don't sit on the PDP.
+            if open_cart_after_atc(driver) or cart_has_items(driver):
+                if cart_line_count(driver) > 1:
+                    trim_cart_to_max_lines(driver, max_lines=1)
                 atc_ok = True
                 break
             print(f"[ATC] click ok but cart empty; retry {attempt}")
             continue
         print(f"[ATC] click failed; retry {attempt}/{config.max_atc_retries}")
+        open_product(driver, item, force_navigate=True)
+        driver.sleep(0.2)
 
     if not atc_ok:
         return ItemRunResult(
@@ -257,13 +263,21 @@ def run_single_item(driver: Driver, data: dict):
 def run_items_parallel(config: AppConfig, *, max_attempts: int | None = None, clear_cart_first: bool = True) -> list[dict]:
     """One browser per item so stock on item A never blocks buying item B."""
 
+    items = config.enabled_items
+    print(
+        f"[PARALLEL] launching {len(items)} browsers — each item polls until buyable"
+    )
+    for item in items:
+        print(f"[PARALLEL] · {item.label}")
+
     runners = []
-    for index, item in enumerate(config.enabled_items):
+    for index, item in enumerate(items):
         profile = parallel_profile_dir(item.label, index)
         runners.append((item, _make_single_item_runner(profile)))
 
     def _worker(item: ItemConfig, runner) -> dict:
-        return runner(
+        print(f"[MONITOR] start {item.label} (own browser)")
+        result = runner(
             {
                 "config": config,
                 "item": item,
@@ -271,6 +285,8 @@ def run_items_parallel(config: AppConfig, *, max_attempts: int | None = None, cl
                 "clear_cart_first": clear_cart_first,
             }
         )
+        print(f"[MONITOR] done {item.label}: {result.get('status')} — {result.get('detail')}")
+        return result
 
     results: list[dict] = []
     with ThreadPoolExecutor(max_workers=len(runners) or 1) as pool:
@@ -278,7 +294,20 @@ def run_items_parallel(config: AppConfig, *, max_attempts: int | None = None, cl
             pool.submit(_worker, item, runner): item for item, runner in runners
         }
         for fut in as_completed(futures):
-            results.append(fut.result())
+            item = futures[fut]
+            try:
+                results.append(fut.result())
+            except Exception as exc:
+                results.append(
+                    {
+                        "label": item.label,
+                        "url": item.normalized_url,
+                        "status": "error",
+                        "detail": str(exc),
+                        "fulfillment": None,
+                        "placed_order": False,
+                    }
+                )
     return results
 
 
@@ -286,7 +315,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Target stock monitor + checkout bot. "
-            "Out-of-stock PDPs refresh until buyable; each item is purchased ASAP."
+            "With 2+ items, each gets its own browser and polls until buyable."
         )
     )
     parser.add_argument(
@@ -298,7 +327,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--parallel",
         action="store_true",
-        help="Open one browser per item (cloned profiles; buys ASAP independently)",
+        help="Force one browser per item (default already when 2+ items enabled)",
+    )
+    parser.add_argument(
+        "--sequential",
+        action="store_true",
+        help="Force one browser for all items (item 2 waits until item 1 finishes)",
     )
     parser.add_argument(
         "--max-attempts",
@@ -312,6 +346,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Override config to actually place orders (requires .env CARD_*)",
     )
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Full flow through checkout review, but never click Place order",
+    )
+    parser.add_argument(
         "--no-clear-cart",
         action="store_true",
         help="Skip clearing the cart before each item (not recommended)",
@@ -320,8 +359,19 @@ def main(argv: list[str] | None = None) -> None:
 
     prepare_runtime()
     config = load_config(args.config)
+    if args.place_order and args.dry_run:
+        raise SystemExit("Use either --place-order or --dry-run, not both")
+    if args.parallel and args.sequential:
+        raise SystemExit("Use either --parallel or --sequential, not both")
     if args.place_order:
         config = config.with_place_order(True)
+    elif args.dry_run:
+        config = config.as_dry_run()
+
+    if args.parallel:
+        config = replace(config, parallel=True)
+    elif args.sequential:
+        config = replace(config, parallel=False)
 
     clear_cart_first = not args.no_clear_cart
 
@@ -350,7 +400,21 @@ def main(argv: list[str] | None = None) -> None:
     if not config.enabled_items:
         raise SystemExit("No enabled items in configuration.json")
 
-    if args.parallel and len(config.enabled_items) > 1:
+    use_parallel = config.use_parallel()
+    mode = "parallel (1 browser per item)" if use_parallel else "sequential (one browser)"
+    print(f"mode={mode}")
+    if use_parallel:
+        print(
+            f"[PARALLEL] {len(config.enabled_items)} items → one browser each "
+            "(OOS items keep refreshing until buyable)"
+        )
+    if use_parallel and args.max_attempts is not None:
+        print(
+            f"WARNING: --max-attempts={args.max_attempts} stops EACH item after that many "
+            "polls — OOS products will NOT keep refreshing. Omit --max-attempts for forever."
+        )
+
+    if use_parallel:
         results = run_items_parallel(
             config,
             max_attempts=args.max_attempts,

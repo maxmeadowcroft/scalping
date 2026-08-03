@@ -1,0 +1,22 @@
+{
+  "url": "https://round1usa.cmpgn.page/Rls7N5",
+  "refresh_interval_seconds": 0.35,
+  "refresh_jitter_seconds": 0.15,
+  "phase": "3",
+  "location_match": "albuquerque|coronado|nm\\t",
+  "agree_terms": true,
+  "marketing_opt_in": false,
+  "submit": true,
+  "solver": "capsolver",
+  "solver_retries": 3,
+  "submit_retries": 2,
+  "parallel": true,
+  "stagger_seconds": 0.4,
+  "entries": [
+    {
+      "first_name": "Max",
+      "last_name": "Meadowcroft",
+      "email": "maxmeadowcroft61@gmail.com"
+    }
+  ]
+}

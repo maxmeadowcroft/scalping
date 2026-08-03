@@ -8,7 +8,9 @@ fulfillment cells.
 
 from __future__ import annotations
 
+import random
 import re
+import time
 from dataclasses import dataclass
 from enum import Enum
 
@@ -97,14 +99,35 @@ def classify_stock_from_text(text: str) -> StockCheckResult:
     return StockCheckResult(StockStatus.UNKNOWN, "no_signal", excerpt)
 
 
-def _first_present(driver: Driver, selectors: list[str], wait: float = 1.0):
-    for selector in selectors:
-        try:
-            el = driver.select(selector, wait)
-        except Exception:
-            el = None
-        if el is not None:
-            return el, selector
+def _first_present(driver: Driver, selectors: list[str], wait: float = 0.0):
+    """Find first matching selector. Default wait=0 (instant) for hot paths."""
+    if wait and wait > 0:
+        for selector in selectors:
+            try:
+                el = driver.select(selector, wait)
+            except Exception:
+                el = None
+            if el is not None:
+                return el, selector
+        return None, None
+    # Instant multi-selector probe via JS — no Botasaurus waits.
+    try:
+        hit = driver.run_js(
+            f"""
+            const sels = {selectors!r};
+            for (const s of sels) {{
+              try {{
+                const el = document.querySelector(s);
+                if (el) return s;
+              }} catch (e) {{}}
+            }}
+            return null;
+            """
+        )
+    except Exception:
+        hit = None
+    if hit:
+        return True, hit
     return None, None
 
 
@@ -136,7 +159,7 @@ def _fulfillment_section_text(driver: Driver) -> str:
         return ""
 
 
-def _wait_for_pdp(driver: Driver, wait: float = 8.0) -> None:
+def _wait_for_pdp(driver: Driver, wait: float = 1.5) -> None:
     try:
         driver.wait_for_element(
             '[data-test="@web/AddToCart/FulfillmentSection"], '
@@ -145,13 +168,13 @@ def _wait_for_pdp(driver: Driver, wait: float = 8.0) -> None:
             '[data-test="product-title"], '
             '[data-test="shippingButton"], '
             '[data-test="outOfStockMessage"]',
-            wait=int(wait),
+            wait=max(1, int(wait)),
         )
     except Exception:
-        driver.sleep(min(2.0, wait))
+        time.sleep(min(0.3, wait))
 
 
-def _wait_for_buybox_signal(driver: Driver, *, timeout: float = 8.0) -> str:
+def _wait_for_buybox_signal(driver: Driver, *, timeout: float = 1.2) -> str:
     """Poll until the fulfillment section shows a decisive stock signal."""
     elapsed = 0.0
     last = ""
@@ -174,10 +197,10 @@ def _wait_for_buybox_signal(driver: Driver, *, timeout: float = 8.0) -> str:
             )
         ):
             return last
-        driver.sleep(0.5)
-        elapsed += 0.5
+        # time.sleep — driver.sleep prints "Sleeping for…" and adds overhead
+        time.sleep(0.05)
+        elapsed += 0.05
     return last
-
 
 def open_product(driver: Driver, item: ItemConfig, *, force_navigate: bool = True) -> None:
     """Navigate to the PDP (or reload if already there)."""
@@ -250,22 +273,22 @@ def check_stock(
                 section_raw[:300],
             )
 
-    oos_el, oos_sel = _first_present(driver, OOS_SELECTORS, wait=0.8)
+    oos_el, oos_sel = _first_present(driver, OOS_SELECTORS, wait=0)
     if oos_el is not None:
         return StockCheckResult(StockStatus.OUT_OF_STOCK, f"selector:{oos_sel}")
 
-    cell_el, cell_sel = _first_present(driver, FULFILLMENT_CELL_SELECTORS, wait=0.8)
+    cell_el, cell_sel = _first_present(driver, FULFILLMENT_CELL_SELECTORS, wait=0)
     if cell_el is not None:
         return StockCheckResult(StockStatus.IN_STOCK, f"selector:{cell_sel}")
 
     atc_selectors = SHIP_ATC_SELECTORS + PICKUP_ATC_SELECTORS + GENERIC_ATC_SELECTORS
-    atc_el, atc_sel = _first_present(driver, atc_selectors, wait=0.8)
+    atc_el, atc_sel = _first_present(driver, atc_selectors, wait=0)
     if atc_el is not None:
         return StockCheckResult(StockStatus.IN_STOCK, f"selector:{atc_sel}")
 
     text = _page_text(driver)
     try:
-        oos_node = driver.get_element_containing_text("Out of stock", wait=0.5)
+        oos_node = driver.get_element_containing_text("Out of stock", wait=0.05)
     except Exception:
         oos_node = None
     if oos_node is not None and not cell_el:
@@ -327,11 +350,11 @@ def _select_fulfillment_cell(driver: Driver, prefer_pickup: bool) -> str | None:
         ]
     )
     for name, selector in order:
-        if driver.select(selector, 1) is None:
+        if driver.select(selector, 0.4) is None:
             continue
         try:
             driver.click(selector)
-            driver.sleep(1.2)
+            driver.sleep(0.3)
             return name
         except Exception:
             continue
@@ -343,7 +366,7 @@ def _already_in_cart(driver: Driver) -> bool:
         text = _fulfillment_section_text(driver).lower()
         if re.search(r"\d+\s+in cart", text):
             return True
-        el = driver.get_element_containing_text("in cart", wait=0.5)
+        el = driver.get_element_containing_text("in cart", wait=0.05)
         return el is not None
     except Exception:
         return False
@@ -351,19 +374,37 @@ def _already_in_cart(driver: Driver) -> bool:
 
 def _click_visible_atc(driver: Driver) -> bool:
     ordered = SHIP_ATC_SELECTORS + PICKUP_ATC_SELECTORS + GENERIC_ATC_SELECTORS
-    _, selector = _first_present(driver, ordered, wait=1.5)
+    _, selector = _first_present(driver, ordered, wait=0)
     if selector:
         try:
-            driver.click(selector)
-            driver.sleep(1.5)
+            # Human-ish jittered JS click when possible.
+            try:
+                driver.run_js(
+                    f"""
+                    const el = document.querySelector({selector!r});
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    const x = r.left + r.width * (0.4 + Math.random() * 0.2);
+                    const y = r.top + r.height * (0.4 + Math.random() * 0.2);
+                    const o = {{bubbles:true,cancelable:true,view:window,clientX:x,clientY:y,button:0}};
+                    for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {{
+                      el.dispatchEvent(t.startsWith('pointer')
+                        ? new PointerEvent(t, Object.assign({{}}, o, {{pointerId:1,pointerType:'mouse',isPrimary:true}}))
+                        : new MouseEvent(t, o));
+                    }}
+                    try {{ el.click(); }} catch (e) {{}}
+                    return true;
+                    """
+                )
+            except Exception:
+                driver.click(selector)
             return True
         except Exception:
             pass
 
     for label in ("Add to cart", "Ship it", "Order Pickup", "Deliver it"):
         try:
-            # Avoid related-product chooseOptionsButton by preferring data-test buttons first
-            btn = driver.get_element_containing_text(label, wait=1.0)
+            btn = driver.get_element_containing_text(label, wait=0.18)
             if btn is None:
                 continue
             test = ""
@@ -374,7 +415,6 @@ def _click_visible_atc(driver: Driver) -> bool:
             if "chooseoptions" in test:
                 continue
             btn.click()
-            driver.sleep(1.5)
             return True
         except Exception:
             continue
@@ -387,12 +427,7 @@ def add_to_cart(
     *,
     prefer_pickup: bool = True,
 ) -> bool:
-    """Select fulfillment, set qty, click Add to cart on an in-stock PDP.
-
-    When prefer_pickup is set, ATC via the pickup cell so cheap carts do not
-    create a shipping line that hits Target's $35 minimum (and so a later
-    pickup ATC retry does not leave two lines of the same item).
-    """
+    """Select fulfillment, set qty, spam Add to cart until it sticks."""
     set_quantity(driver, item.max_quantity)
 
     order = (
@@ -408,24 +443,33 @@ def add_to_cart(
             ("pickup", '[data-test="fulfillment-cell-pickup"]'),
         ]
     )
+
+    chosen = None
     for name, selector in order:
-        if driver.select(selector, 0.8) is None:
+        if driver.select(selector, 0.25) is None:
             continue
         try:
             driver.click(selector)
-            driver.sleep(1.2)
+            driver.sleep(random.uniform(0.05, 0.12))
+            chosen = name
+            break
         except Exception:
             continue
-        set_quantity(driver, item.max_quantity)
-        if _click_visible_atc(driver):
-            print(f"[ATC] added via {name}")
-            driver.sleep(1.5)
-            return True
 
-    if _click_visible_atc(driver):
-        driver.sleep(1.5)
-        return True
-    return False
+    set_quantity(driver, item.max_quantity)
+
+    # Spam ATC — competing bots win on first successful land.
+    for attempt in range(1, 10):
+        if _already_in_cart(driver) or cart_looks_updated(driver):
+            print(f"[ATC] confirmed via {chosen or 'default'} (try {attempt})")
+            return True
+        if _click_visible_atc(driver):
+            print(f"[ATC] click via {chosen or 'default'} ({attempt})")
+        driver.sleep(random.uniform(0.05, 0.12))
+        if _already_in_cart(driver) or cart_looks_updated(driver):
+            print(f"[ATC] added via {chosen or 'default'}")
+            return True
+    return _already_in_cart(driver) or cart_looks_updated(driver)
 
 
 def dismiss_post_atc_modals(driver: Driver) -> None:
@@ -438,10 +482,10 @@ def dismiss_post_atc_modals(driver: Driver) -> None:
         "Continue without",
     ):
         try:
-            el = driver.get_element_containing_text(label, wait=0.4)
+            el = driver.get_element_containing_text(label, wait=0.12)
             if el is not None:
                 el.click()
-                driver.sleep(0.4)
+                driver.sleep(0.08)
         except Exception:
             continue
 
@@ -451,15 +495,15 @@ def cart_looks_updated(driver: Driver) -> bool:
     if _already_in_cart(driver):
         return True
     try:
-        if driver.get_element_containing_text("View cart & check out", wait=1):
+        if driver.get_element_containing_text("View cart & check out", wait=0.15):
             return True
-        if driver.get_element_containing_text("Added to cart", wait=0.5):
+        if driver.get_element_containing_text("Added to cart", wait=0.1):
             return True
-        if driver.select('[data-test="cartItem-checkoutButton"]', 0.5):
+        if driver.select('[data-test="cartItem-checkoutButton"]', 0.12):
             return True
-        qty = driver.select('[data-test="@web/CartLinkQuantity"]', 0.5)
+        qty = driver.select('[data-test="@web/CartLinkQuantity"]', 0.12)
         if qty is not None:
             return True
     except Exception:
-        return False
+        pass
     return False

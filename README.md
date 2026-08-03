@@ -102,12 +102,17 @@ Example items already in the config (handy for dry-run testing):
 ## Run the bot
 
 ```bash
-./scraping/run_bot.sh                  # sequential, dry-run, poll forever
-./scraping/run_bot.sh --parallel       # one browser per item (cloned profiles)
+./scraping/run_bot.sh                  # dry-run; 2+ items → parallel browsers
+./scraping/run_bot.sh --sequential     # one browser; item 2 waits for item 1
+./scraping/run_bot.sh --parallel       # force one browser per item
 ./scraping/run_bot.sh --max-attempts 3 # stop after 3 polls per item
 ./scraping/run_bot.sh --place-order    # REAL purchase — needs .env CARD_*
 ./scraping/run_bot.sh --no-clear-cart  # keep existing cart lines (rare)
 ```
+
+With multiple enabled items, each product gets its **own Chrome window** (cloned
+logged-in profile) so an in-stock buy never blocks OOS refresh on another item.
+Omit `--max-attempts` to poll the OOS PDPs forever.
 
 Equivalent module form:
 
