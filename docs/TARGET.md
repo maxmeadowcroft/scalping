@@ -51,13 +51,14 @@ Logs under `~/.scalping/logs/target/` (not committed).
 | TCIN | Product | Stock signals | ATC API | Notes |
 |------|---------|---------------|---------|-------|
 | `1011209273` | Mega Greninja ex Premium | Often DOM OOS while Redsky `ship=IN_STOCK` | All variants `401 T83072242` | Buy-box lag vs API; `cart_views` warm `200` |
-| `1011483406` | Pitch Black ETB | **Stable** DOM + API `IN_STOCK` (~19/19 polls) | **90/90** `401 T83072242` across all variants | `cart_views` warm mostly **200** after early 429; `cart_looks_updated` false-positives skip UI ATC — cart_empty flip-flops |
+| `1011483406` | Pitch Black ETB | **Stable** DOM + API `IN_STOCK` (60/60 in throttled run) | API **30/30** `401 T83072242`; UI hook same | Throttle working (54 stock-only vs 6 ATC probes). `cart_views` **200** with intermittent **429**. UI fetch body uses **`channel_id`/`item_channel_id` `"90"`** + `fulfillment_test_mode` — still AUTH_DENIED. `add_to_cart` can return ok=True while hooked call is 401 (false success). |
 
 Affiliate PDP examples: [Greninja `A-1011209273`](https://www.target.com/p/zephyr/-/A-1011209273), [Pitch Black ETB `A-1011483406`](https://www.target.com/p/zephyr/-/A-1011483406).
 
-### Progressive note (~02:20 MT)
+### Progressive notes
 
-Pitch Black stayed buyable for ~15+ minutes with shipping ATC button visible. Direct `cart_items` never cleared AUTH_DENIED. Hunt was over-probing (5 variants × every buyable poll) — throttle ATC probes; stock-only most ticks.
+- **~02:20 MT** — Pitch Black stayed buyable; direct `cart_items` never cleared AUTH_DENIED; over-probe fixed via `--atc-every`.
+- **~02:30 MT** — Throttled session: stock solid; UI ATC captured live body with channel **`"90"`** (not desktop `"10"`) under our desktop UA — mismatch or page A/B. Treat UI `ok` without `last_cart_call.status==2xx` as failure.
 
 ### Chaos Rising earlier (`A-95298172` / blister `95298174`)
 
