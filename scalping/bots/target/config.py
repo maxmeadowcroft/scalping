@@ -148,6 +148,8 @@ class AppConfig:
     preferred_store_name: str = "Albuquerque Wyoming"
     max_atc_retries: int = 3
     checkout_auth_timeout_seconds: float = 300.0
+    # Place order clicker window after cart is secured (seconds).
+    place_order_spam_seconds: float = 1800.0
     # None = auto: parallel when 2+ enabled items
     parallel: bool | None = None
     shipping_address: ShippingAddress = field(
@@ -311,6 +313,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         ),
         max_atc_retries=int(raw.get("max_atc_retries", 3)),
         checkout_auth_timeout_seconds=auth_timeout,
+        place_order_spam_seconds=float(raw.get("place_order_spam_seconds", 1800)),
         parallel=parallel,
         shipping_address=shipping,
         payment=load_payment_from_env(),

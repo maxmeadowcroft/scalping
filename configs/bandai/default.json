@@ -1,0 +1,11 @@
+{
+  "refresh_interval_seconds": 0.2,
+  "refresh_jitter_seconds": 0.05,
+  "max_atc_retries": 5,
+  "dry_run": true,
+  "place_order": false,
+  "qty": 1,
+  "item_url": "https://p-bandai.com/us/item/N2904549002",
+  "item_id": "N2904549002",
+  "label": "bandai-test-sku"
+}

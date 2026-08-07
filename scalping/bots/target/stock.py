@@ -399,10 +399,153 @@ def check_stock(
     return StockCheckResult(StockStatus.UNKNOWN, "no_buybox_signal", excerpt)
 
 
-def set_quantity(driver: Driver, quantity: int) -> None:
-    """Set PDP qty. If `quantity` isn't offered, pick the highest available option."""
-    if quantity <= 1:
-        return
+def set_quantity(driver: Driver, quantity: int) -> int | None:
+    """Set PDP buy-box qty to `quantity`, or highest offered ≤ want.
+
+    Call this *after* selecting the fulfillment cell — Target rebuilds the
+    buy box on Shipping/Pickup click and resets Qty to 1.
+    Returns the qty actually selected, or None if the picker was not found.
+    """
+    want = max(1, int(quantity))
+
+    try:
+        chosen = driver.run_js(
+            f"""
+            const want = {want};
+            const parseN = (raw) => {{
+              const m = String(raw || '').match(/\\b([1-9][0-9]?)\\b/);
+              if (!m) return null;
+              const n = parseInt(m[1], 10);
+              return (Number.isFinite(n) && n >= 1 && n <= 99) ? n : null;
+            }};
+            const root = document.querySelector('[data-test="@web/AddToCart/FulfillmentSection"]')
+              || document.querySelector('[data-test="@web/AddToContentLayout"]')
+              || document;
+
+            const pickFromSelect = (sel) => {{
+              if (!sel || sel.tagName !== 'SELECT') return null;
+              let best = null, bestOpt = null, exact = null, maxOffered = null;
+              for (const opt of Array.from(sel.options || [])) {{
+                const n = parseN(opt.value) ?? parseN(opt.textContent);
+                if (n == null) continue;
+                if (maxOffered === null || n > maxOffered) maxOffered = n;
+                if (n === want) exact = opt;
+                if (n <= want && (best === null || n > best)) {{ best = n; bestOpt = opt; }}
+              }}
+              const use = exact || bestOpt;
+              if (!use) return null;
+              const n = parseN(use.value) ?? parseN(use.textContent);
+              sel.value = use.value;
+              sel.dispatchEvent(new Event('input', {{bubbles:true}}));
+              sel.dispatchEvent(new Event('change', {{bubbles:true}}));
+              return {{n, maxOffered, options: (sel.options || []).length}};
+            }};
+
+            // Native <select>
+            for (const sel of root.querySelectorAll('select')) {{
+              const meta = (
+                (sel.getAttribute('data-test') || '') + ' ' +
+                (sel.id || '') + ' ' +
+                (sel.name || '') + ' ' +
+                (sel.getAttribute('aria-label') || '')
+              ).toLowerCase();
+              const qtyish = meta.includes('quant') || meta.includes('qty');
+              if (!qtyish && root.querySelectorAll('select').length > 1) continue;
+              const hit = pickFromSelect(sel);
+              if (hit) return {{via:'select', ...hit}};
+            }}
+
+            // Button / listbox ("Qty 1") — common on modern Target PDPs
+            const openers = Array.from(root.querySelectorAll(
+              'button, [role="button"], [role="combobox"], select, ' +
+              '[data-test*="quantity" i], [data-test*="Quantity" i], ' +
+              '[aria-label*="quantity" i], [aria-label*="Quantity" i], [id*="quantity" i]'
+            ));
+            let opener = null;
+            for (const el of openers) {{
+              if (el.tagName === 'SELECT') continue;
+              const t = ((el.innerText || el.getAttribute('aria-label') || '') + '')
+                .replace(/\\s+/g, ' ').trim().toLowerCase();
+              const test = (el.getAttribute('data-test') || '').toLowerCase();
+              const id = (el.id || '').toLowerCase();
+              if (
+                test.includes('quantity') || id.includes('quantity') ||
+                /^qty\\b/.test(t) || t.includes('quantity') || /\\bqty\\b/.test(t)
+              ) {{
+                opener = el;
+                break;
+              }}
+            }}
+            if (opener) {{
+              try {{ opener.click(); }} catch (e) {{}}
+              const deadline = Date.now() + 1200;
+              let best = null, bestEl = null, maxOffered = null, optionCount = 0;
+              while (Date.now() < deadline) {{
+                const opts = Array.from(document.querySelectorAll(
+                  '[role="listbox"] [role="option"], [role="option"], ' +
+                  '[data-test*="quantity" i] li, [data-test*="Quantity" i] li, ' +
+                  'ul[role="listbox"] li, [id*="quantity" i] [role="option"], ' +
+                  '[class*="Quantity"] [role="option"], [class*="quantity"] li'
+                ));
+                optionCount = opts.length;
+                for (const o of opts) {{
+                  const n = parseN(o.innerText) ?? parseN(o.getAttribute('aria-label'));
+                  if (n == null) continue;
+                  if (maxOffered === null || n > maxOffered) maxOffered = n;
+                  if (n === want) {{
+                    o.click();
+                    return {{via:'listbox', n, maxOffered, options: optionCount}};
+                  }}
+                  if (n <= want && (best === null || n > best)) {{
+                    best = n; bestEl = o;
+                  }}
+                }}
+                if (bestEl && Date.now() > deadline - 200) {{
+                  bestEl.click();
+                  return {{via:'listbox', n: best, maxOffered, options: optionCount}};
+                }}
+              }}
+              if (bestEl) {{
+                bestEl.click();
+                return {{via:'listbox', n: best, maxOffered, options: optionCount}};
+              }}
+              // Close stray menu if nothing selectable
+              try {{ document.body.click(); }} catch (e) {{}}
+            }}
+
+            // Number / stepper input
+            for (const inp of root.querySelectorAll(
+              'input[type="number"], input[name*="quant" i], input[id*="quant" i]'
+            )) {{
+              const maxAttr = parseN(inp.getAttribute('max'));
+              const use = (maxAttr != null && maxAttr < want) ? maxAttr : want;
+              const proto = window.HTMLInputElement && window.HTMLInputElement.prototype;
+              const desc = proto && Object.getOwnPropertyDescriptor(proto, 'value');
+              if (desc && desc.set) desc.set.call(inp, String(use));
+              else inp.value = String(use);
+              inp.dispatchEvent(new Event('input', {{bubbles:true}}));
+              inp.dispatchEvent(new Event('change', {{bubbles:true}}));
+              return {{via:'input', n: use, maxOffered: maxAttr}};
+            }}
+            return null;
+            """
+        )
+        if isinstance(chosen, dict) and chosen.get("n"):
+            n = int(chosen["n"])
+            max_offered = chosen.get("maxOffered")
+            via = chosen.get("via")
+            extra = ""
+            if max_offered is not None and int(max_offered) < want:
+                extra = f" (max offered {max_offered})"
+            print(
+                f"[QTY] PDP set to {n} via {via} (wanted {want}{extra})"
+            )
+            time.sleep(0.2)
+            return n
+    except Exception as exc:
+        print(f"[QTY] JS set failed: {exc}")
+
+    # Fallback: Botasaurus selectors — pick highest available ≤ want
     selectors = [
         '[data-test="quantity-select"]',
         '[data-test="custom-quantity-picker"]',
@@ -414,61 +557,32 @@ def set_quantity(driver: Driver, quantity: int) -> None:
         el = driver.select(selector, 0.35)
         if el is None:
             continue
+        for q in range(want, 0, -1):
+            try:
+                driver.select_option(selector, str(q))
+                print(f"[QTY] select_option {q} (wanted {want})")
+                return q
+            except Exception:
+                continue
         try:
-            driver.select_option(selector, str(quantity))
-            return
-        except Exception:
-            pass
-        # <select>: choose highest option <= requested
-        try:
-            chosen = driver.run_js(
-                f"""
-                const el = document.querySelector({selector!r});
-                if (!el || el.tagName !== 'SELECT') return null;
-                const want = {int(quantity)};
-                let best = null;
-                for (const opt of el.options) {{
-                  const n = parseInt(opt.value || opt.textContent, 10);
-                  if (!Number.isFinite(n) || n < 1) continue;
-                  if (n === want) {{ el.value = opt.value; el.dispatchEvent(new Event('change', {{bubbles:true}})); return n; }}
-                  if (n <= want && (best === null || n > best)) best = n;
-                }}
-                if (best !== null) {{
-                  for (const opt of el.options) {{
-                    const n = parseInt(opt.value || opt.textContent, 10);
-                    if (n === best) {{
-                      el.value = opt.value;
-                      el.dispatchEvent(new Event('change', {{bubbles:true}}));
-                      return best;
-                    }}
-                  }}
-                }}
-                return null;
-                """
-            )
-            if chosen:
-                print(f"[QTY] select set to {chosen} (wanted {quantity})")
-                return
-        except Exception:
-            pass
-        try:
-            # Custom picker: open then click the desired qty option (or closest)
             driver.click(selector)
-            time.sleep(0.12)
-            for q in range(quantity, 0, -1):
-                if driver.get_element_with_exact_text(str(q), wait=0.15):
+            time.sleep(0.15)
+            for q in range(want, 0, -1):
+                if driver.get_element_with_exact_text(str(q), wait=0.2):
                     driver.click_element_containing_text(str(q))
-                    if q != quantity:
-                        print(f"[QTY] picker set to {q} (wanted {quantity})")
-                    return
+                    print(f"[QTY] picker set to {q} (wanted {want})")
+                    return q
         except Exception:
             pass
         try:
             driver.clear(selector)
-            driver.type(selector, str(quantity))
-            return
+            driver.type(selector, str(want))
+            print(f"[QTY] typed {want}")
+            return want
         except Exception:
             continue
+    print(f"[QTY] could not set PDP quantity to {want}")
+    return None
 
 
 def _select_fulfillment_cell(driver: Driver, prefer_pickup: bool) -> str | None:
@@ -637,27 +751,26 @@ def ensure_mobile_viewport(driver: Driver) -> None:
 
 
 def cart_looks_updated(driver: Driver) -> bool:
-    """ATC success — require real cart signals, not related-product copy."""
+    """ATC success — require buy-box 'N in cart' or checkout CTA after a real add.
+
+    Do NOT trust the header cart badge alone (stale / empty-cart ghosts caused
+    false ATC success during Pitch Black probes).
+    """
     if _already_in_cart(driver):
         return True
     try:
         return bool(
             driver.run_js(
                 """
-                // Strong signals only — avoid related rails / marketing copy.
+                // Checkout CTAs that only appear after a successful add.
                 if (document.querySelector('[data-test="cartItem-checkoutButton"]')) return true;
-                if (document.querySelector('[data-test="checkout-button"]')) return true;
-                const el = document.querySelector('[data-test="@web/CartLinkQuantity"]');
-                if (el) {
-                  const n = parseInt((el.textContent || '').replace(/[^0-9]/g, ''), 10);
-                  if (Number.isFinite(n) && n > 0) return true;
-                }
                 // Fulfillment buy-box "N in cart" only.
                 const box = document.querySelector('[data-test="@web/AddToCart/FulfillmentSection"]');
                 if (box) {
                   const t = (box.innerText || '').toLowerCase();
                   const m = t.match(/(\\d+)\\s+in cart/);
                   if (m && parseInt(m[1], 10) >= 1) return true;
+                  if (t.includes('view cart & check out') || t.includes('view cart and check out')) return true;
                 }
                 return false;
                 """
@@ -678,6 +791,53 @@ def _buybox_debug(driver: Driver) -> str:
         )
     except Exception as exc:
         return f"probe_err={exc}"
+
+
+def _is_traffic_delay_text(text: str | None) -> bool:
+    """Target's popular-item / high-traffic cart queue (hits humans too)."""
+    if not text:
+        return False
+    t = text.lower()
+    return (
+        ("popular item" in t and "delay" in t)
+        or ("managing high traffic" in t)
+        or ("high traffic right now" in t)
+        or ("high demand" in t and ("try again" in t or "temporarily" in t))
+    )
+
+
+def _traffic_delay_visible(driver: Driver) -> bool:
+    try:
+        return bool(
+            driver.run_js(
+                """
+                const nodes = Array.from(document.querySelectorAll(
+                  '[role="alert"], [data-test*="alert" i], [data-test*="toast" i], '
+                  + '[class*="Alert"], [class*="Toast"], [class*="Banner"], div, p, span'
+                )).slice(0, 80);
+                for (const el of nodes) {
+                  const t = ((el.innerText || '') + '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  if (!t || t.length > 280) continue;
+                  if (t.includes('popular item') && t.includes('delay')) return true;
+                  if (t.includes('managing high traffic')) return true;
+                  if (t.includes('high traffic right now')) return true;
+                }
+                return false;
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def _cart_call_is_traffic_delay(last: dict | None) -> bool:
+    if not last:
+        return False
+    blob = " ".join(
+        str(last.get(k) or "")
+        for k in ("resp", "error", "body", "message")
+    )
+    return _is_traffic_delay_text(blob)
 
 
 def _install_cart_fetch_hook(driver: Driver) -> None:
@@ -723,8 +883,14 @@ def _last_cart_call(driver: Driver) -> dict | None:
     return None
 
 
-def _reload_pdp_soft(driver: Driver, item: ItemConfig) -> None:
-    """Reload PDP to refresh Akamai / session sensors after AUTH_DENIED."""
+def _reload_pdp_soft(
+    driver: Driver,
+    item: ItemConfig,
+    *,
+    quantity: int | None = None,
+    prefer_pickup: bool = False,
+) -> None:
+    """Reload PDP to refresh session sensors after AUTH_DENIED / 429."""
     try:
         open_product(driver, item, force_navigate=False)
         time.sleep(0.6)
@@ -736,6 +902,16 @@ def _reload_pdp_soft(driver: Driver, item: ItemConfig) -> None:
             _install_cart_fetch_hook(driver)
         except Exception:
             pass
+    try:
+        _select_fulfillment_cell(driver, prefer_pickup)
+        time.sleep(0.3)
+    except Exception:
+        pass
+    if quantity and quantity > 0:
+        try:
+            set_quantity(driver, quantity)
+        except Exception:
+            pass
 
 
 def add_to_cart(
@@ -743,17 +919,17 @@ def add_to_cart(
     item: ItemConfig,
     *,
     prefer_pickup: bool = False,
+    auth_timeout: float = 120.0,
 ) -> bool:
-    """UI-first ATC (channel 90 path), then careful API. Survives 429 / AUTH_DENIED.
+    """UI-first ATC. Avoid 'Sign in to buy now' unless Add to cart is unavailable.
 
-    Live capture showed Target's own Add to cart posts channel_id=90. Under drop
-    load we see empty-body 429 and T83072242 (_ERR_AUTH_DENIED). Strategy:
-      1) Let the page fire the real fetch (UI click)
-      2) On 429 → long backoff + reload, do NOT spam
-      3) On 401 AUTH_DENIED → reload sensors, wait, retry UI
-      4) API web90 only as sparse backup
+    That step-up burns OTP and often isn't required when shippingButton is live.
     """
     from scalping.bots.target.api import cart_api_add, warm_cart_session
+    from scalping.bots.target.checkout import (
+        sign_in_to_buy_visible,
+        wait_for_pdp_purchase_auth,
+    )
 
     # Desktop viewport — matches DESKTOP_UA in runtime (avoid mobile spoof mismatch).
     try:
@@ -781,29 +957,32 @@ def add_to_cart(
         f"cart_id={warm.get('cart_id')} items={warm.get('item_count')}"
     )
 
-    # Guest / blocked session: buy box shows Sign in — don't dig AUTH_DENIED hole.
-    try:
-        guestish = driver.run_js(
-            """
-            const root = document.querySelector('[data-test="@web/AddToCart/FulfillmentSection"]');
-            const t = ((root && root.innerText) || '').toLowerCase();
-            return t.includes('sign in to buy') || !!document.querySelector('[data-test="sign-in-to-buy-now-button"]');
-            """
-        )
-        if guestish:
+    # Prefer Add to cart even when "Sign in to buy now" is also visible.
+    # Only escalate to that step-up if ATC is impossible (no ATC control).
+    want_qty = max(1, int(item.max_quantity or 1))
+    if sign_in_to_buy_visible(driver):
+        probe = _buybox_stock_probe(driver)
+        has_atc = bool(probe.get("enabledAtc") or probe.get("enabledCell"))
+        if has_atc:
             print(
-                "[ATC] 'Sign in to buy now' visible — session not usable for cart. "
-                "Run ./scripts/session-target.sh --force once after a cooldown; "
-                "skipping ATC spam."
+                "[ATC] Sign in to buy visible — ignoring for now; using Add to cart"
             )
-            return False
-    except Exception:
-        pass
+        else:
+            print(
+                "[ATC] no ATC control, only Sign in to buy — step-up required"
+            )
+            if not wait_for_pdp_purchase_auth(driver, timeout_seconds=auth_timeout):
+                print("[ATC] PDP purchase auth failed — cannot ATC yet")
+                return False
+            try:
+                open_product(driver, item, force_navigate=True)
+                time.sleep(0.8)
+                _install_cart_fetch_hook(driver)
+            except Exception:
+                pass
 
-    set_quantity(driver, 1)  # land qty=1 first under allocation
-    print(f"[ATC] UI-first — buybox {_buybox_debug(driver)}")
-
-    # Prefer shipping cell when present (desktop layout).
+    # Prefer shipping cell when present (desktop layout). Qty picker lives in
+    # the rebuilt buy box *after* this click — set quantity only afterward.
     order = (
         [
             ("pickup", '[data-test="fulfillment-cell-pickup"]'),
@@ -833,13 +1012,46 @@ def add_to_cart(
                 break
         except Exception:
             continue
+    if chosen:
+        time.sleep(0.35)
+
+    got_qty = set_quantity(driver, want_qty)
+    print(
+        f"[ATC] UI-first qty={got_qty or '?'} (want {want_qty}) "
+        f"via={chosen or 'default'} — buybox {_buybox_debug(driver)}"
+    )
 
     auth_denies = 0
     rate_limits = 0
-    for attempt in range(1, 16):
+    traffic_delays = 0
+    # Paced retries — not a mash. Outer poll loop re-enters when still in stock.
+    max_attempts = 12
+    for attempt in range(1, max_attempts + 1):
         if _already_in_cart(driver) or cart_looks_updated(driver):
             print(f"[ATC] confirmed ({chosen or 'ui'}) try={attempt}")
             return True
+
+        # Last resort only: several failed ATC tries AND no Add to cart control left.
+        if attempt == 8 and sign_in_to_buy_visible(driver):
+            probe = _buybox_stock_probe(driver)
+            if not (probe.get("enabledAtc") or probe.get("enabledCell")):
+                print(
+                    "[ATC] still no ATC after many tries — Sign in to buy as last resort"
+                )
+                if wait_for_pdp_purchase_auth(
+                    driver, timeout_seconds=min(90.0, auth_timeout)
+                ):
+                    _install_cart_fetch_hook(driver)
+                    try:
+                        open_product(driver, item, force_navigate=True)
+                        time.sleep(0.6)
+                        _install_cart_fetch_hook(driver)
+                        if chosen:
+                            _select_fulfillment_cell(driver, prefer_pickup)
+                            time.sleep(0.3)
+                        set_quantity(driver, want_qty)
+                    except Exception:
+                        pass
 
         before_n = 0
         try:
@@ -849,6 +1061,9 @@ def add_to_cart(
         except Exception:
             before_n = 0
 
+        # Re-apply qty before each click (buy box can reset after failed ATC).
+        set_quantity(driver, want_qty)
+
         clicked = _click_visible_atc(driver)
         if clicked:
             print(f"[ATC] UI click try={attempt} via={chosen or 'default'}")
@@ -856,27 +1071,14 @@ def add_to_cart(
             if attempt % 3 == 1:
                 print(f"[ATC] no ATC button — {_buybox_debug(driver)}")
 
-        time.sleep(0.55)
+        time.sleep(0.85)
         if _already_in_cart(driver) or cart_looks_updated(driver):
-            print(f"[ATC] landed via UI try={attempt}")
-            # Optional qty bump via API once landed
-            if (item.max_quantity or 1) > 1:
-                time.sleep(0.4)
-                bump = cart_api_add(
-                    driver,
-                    tcin=item.tcin or "",
-                    quantity=item.max_quantity,
-                    variant="web90",
-                )
-                print(
-                    f"[ATC] qty bump → {item.max_quantity} "
-                    f"status={bump.status} err={bump.error!r}"
-                )
+            print(f"[ATC] landed via UI try={attempt} (PDP qty, no API bump)")
             return True
 
         last = _last_cart_call(driver)
+        traffic = _traffic_delay_visible(driver) or _cart_call_is_traffic_delay(last)
         if last and before_n is not None:
-            # Only react to a new call
             try:
                 after_n = int(
                     driver.run_js("return (window.__scalpingCartCalls||[]).length") or 0
@@ -888,56 +1090,76 @@ def add_to_cart(
                 print(
                     f"[ATC] page fetch status={st} resp={str(last.get('resp') or '')[:160]!r}"
                 )
-                if last.get("ok"):
+                if last.get("ok") and st and 200 <= st < 300:
                     return True
+                if traffic or _is_traffic_delay_text(str(last.get("resp") or "")):
+                    traffic_delays += 1
+                    wait = 1.2 + random.uniform(0.3, 1.0)
+                    if traffic_delays <= 3 or traffic_delays % 4 == 1:
+                        print(
+                            f"[ATC] traffic/popular delay — paced retry "
+                            f"(hit {traffic_delays}, gap ~{wait:.1f}s)"
+                        )
+                    time.sleep(wait)
+                    if traffic_delays % 5 == 0:
+                        _reload_pdp_soft(driver, item, quantity=want_qty, prefer_pickup=prefer_pickup)
+                    continue
                 if st == 429:
                     rate_limits += 1
-                    wait = min(20.0, 3.0 * rate_limits + random.uniform(0.5, 1.5))
-                    print(f"[ATC] page 429 — cool {wait:.1f}s + reload")
+                    wait = min(45.0, 5.0 * rate_limits + random.uniform(1.0, 3.0))
+                    print(f"[ATC] page 429 — cool {wait:.1f}s + soft reload")
                     time.sleep(wait)
-                    _reload_pdp_soft(driver, item)
+                    _reload_pdp_soft(driver, item, quantity=want_qty, prefer_pickup=prefer_pickup)
                     continue
                 if st == 401 or (
                     isinstance(last.get("resp"), str)
                     and ("_ERR_AUTH_DENIED" in last["resp"] or "T83072242" in last["resp"])
                 ):
                     auth_denies += 1
-                    wait = min(25.0, 4.0 * auth_denies + random.uniform(1.0, 2.0))
+                    wait = min(12.0, 1.5 * auth_denies + random.uniform(0.5, 1.5))
                     print(
-                        f"[ATC] AUTH_DENIED/T83072242 — cool {wait:.1f}s + full reload "
-                        f"({auth_denies})"
+                        f"[ATC] AUTH_DENIED — cool {wait:.1f}s "
+                        f"(deny#{auth_denies}/{max_attempts})"
                     )
                     time.sleep(wait)
-                    open_product(driver, item, force_navigate=True)
-                    time.sleep(0.8)
-                    _install_cart_fetch_hook(driver)
+                    if auth_denies >= 4:
+                        _reload_pdp_soft(driver, item, quantity=want_qty, prefer_pickup=prefer_pickup)
+                    if auth_denies >= 8:
+                        print("[ATC] AUTH_DENIED budget exhausted — stop this ATC pass")
+                        break
                     continue
 
-        # Sparse API backup every few tries (never a storm).
-        if attempt in (4, 8, 12):
-            variant = ("web", "tempo", "web90")[(attempt // 4) % 3]
-            res = cart_api_add(driver, tcin=item.tcin or "", quantity=1, variant=variant)
+        if traffic:
+            traffic_delays += 1
+            wait = 1.2 + random.uniform(0.3, 1.0)
+            if traffic_delays <= 3 or traffic_delays % 4 == 1:
+                print(f"[ATC] traffic toast — paced retry (hit {traffic_delays})")
+            time.sleep(wait)
+            continue
+
+        # One sparse API backup with desired qty (not qty=1 + bump).
+        if traffic_delays == 0 and auth_denies < 2 and attempt == 6:
+            res = cart_api_add(
+                driver,
+                tcin=item.tcin or "",
+                quantity=want_qty,
+                variant="web",
+            )
             print(
-                f"[ATC] api backup variant={variant} status={res.status} err={res.error!r}"
+                f"[ATC] api backup qty={want_qty} status={res.status} err={res.error!r}"
             )
             if res.ok:
                 return True
-            if res.status == 429:
+            if _is_traffic_delay_text(res.error):
+                traffic_delays += 1
+            elif res.status == 429:
                 rate_limits += 1
-                wait = min(20.0, 4.0 * rate_limits)
-                print(f"[ATC] api 429 — cool {wait:.1f}s")
-                time.sleep(wait)
-                _reload_pdp_soft(driver, item)
+                time.sleep(min(20.0, 4.0 * rate_limits))
+                _reload_pdp_soft(driver, item, quantity=want_qty, prefer_pickup=prefer_pickup)
             elif res.status == 401:
                 auth_denies += 1
-                wait = min(25.0, 5.0 * auth_denies)
-                print(f"[ATC] api AUTH_DENIED — cool {wait:.1f}s + reload")
-                time.sleep(wait)
-                open_product(driver, item, force_navigate=True)
-                time.sleep(0.8)
-                _install_cart_fetch_hook(driver)
 
-        time.sleep(0.15)
+        time.sleep(0.6 + random.uniform(0.2, 0.6))
 
     return _already_in_cart(driver) or cart_looks_updated(driver)
 

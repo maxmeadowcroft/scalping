@@ -125,7 +125,12 @@ def _attempt_purchase(driver: Driver, item: ItemConfig, config: AppConfig) -> It
         # the window and races other shoppers. Only re-open PDP if needed.
         if attempt > 1:
             open_product(driver, item, force_navigate=True)
-        if add_to_cart(driver, item, prefer_pickup=config.prefer_pickup):
+        if add_to_cart(
+            driver,
+            item,
+            prefer_pickup=config.prefer_pickup,
+            auth_timeout=float(config.checkout_auth_timeout_seconds or 120),
+        ):
             dismiss_post_atc_modals(driver)
             # Jump straight to cart via the drawer CTA — don't sit on the PDP.
             if open_cart_after_atc(driver) or cart_has_items(driver):

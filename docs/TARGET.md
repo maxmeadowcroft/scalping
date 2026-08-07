@@ -4,91 +4,125 @@ Poll Target product pages, add to cart, checkout (shipping preferred, pickup fal
 
 Code lives in `scalping/bots/target/`.
 
-## Tonight (data probe — do not buy)
+## Tonight (live buy)
 
 ```bash
 ./scripts/session-target.sh --check
-uv run python -m scalping.bots.target.hunt_data --config configs/target/tonight.json --no-checkout
+./scripts/run-target.sh --config configs/target/tonight.json --place-order --max-attempts 50
 ```
 
-Config: `configs/target/tonight.json` — Pitch Black ETB `A-1011483406`, qty 1, **`dry_run: true` / `place_order: false`**.
+Config: `configs/target/tonight.json` — First Partner S3 `A-1011960739`, qty **2**, `place_order: true`, Place order clicker window 30 min.
 
-Manual login (when soft-blocked): `uv run python sessions/wait_for_login.py`  
-Burned profile reset: `rm -rf ~/.scalping/chrome-profiles/target` then wait_for_login again.
+Manual login: `uv run python sessions/wait_for_login.py`  
+Burned profile: `rm -rf ~/.scalping/chrome-profiles/target` then wait_for_login.
+
+## Consensus buy path (Discord Aug 2026)
+
+Community consensus under saturation (not our own confirmed run):
+
+1. **Mobile app** — spam ATC until line(s) land in cart (native SDK trust >> desktop web ATC).
+2. **PC** — open `https://www.target.com/checkout` on the same account.
+3. **F5** until the cart hydrates / Place order is visible.
+4. **Free Mouse Clicker** on Place order (settings shared in Buy-Success).
+
+Split layers: mash ATC on **mobile**, mash Place order on **PC after cart exists**. Desktop web `401 T83072242` is a different problem (do not treat every `401` as Shape).
+
+Bot mirrors steps 2–4 once a cart line exists. Mobile ATC remains manual / app-side for now (emulator plan shelved).
+
+## Shape / F5 + commerce model (research Aug 2026)
+
+### Session trust is multi-signal — not a magic header
+
+“Shape session trust” = correlated client state, not one cookie/token/header:
+
+\[
+Decision_r = f(telemetry_r,\ client\ session,\ cookie\ age,\ sequence,\ fingerprints,\ endpoint\ policy,\ recent\ behavior)
+\]
+
+F5 web: JS collects telemetry → attach as **headers and/or POST body** → evaluate at edge before origin. Correlates via client token (shared for protected requests from a page that ran the JS), bot cookie + age, fingerprints, referer, channel, endpoint policy.
+
+F5 mobile SDK: separate stack; unique token **per header set**; client token ~4h window; init early or race.
+
+**`TELEM_BEFORE_ATC` vs `TELEM_AFTER_ATC`** is a real race: F5 documents legitimate “Token Missing” when the protected request fires before JS loads. Warm vs cold cache changes timing. Telemetry may live in the body — header-name-only captures can miss it.
+
+**Never infer `TOKEN_MISSING` from HTTP status alone** — that label needs operator-side diagnostics. Edge can return app-like `401` / invalid-credential / spinner / `202`. A client HAR shows sequencing and correlations; it usually **cannot prove** which internal layer produced a generic denial.
+
+Historical Target `ssx.mod.js` / `X-GyJwza5Z-*` = dated snapshots, not current proof. Header harvest/replay is a weak model.
+
+Web ≠ app: separate policies/infra possible; success on one surface does not imply the other.
+
+### Commerce states (cart ≠ order)
+
+| State | Means | Does not mean |
+|-------|--------|----------------|
+| `PRODUCT_VISIBLE` | Offer on PDP | Real-time allocation |
+| `ATC_ACCEPTED` / `CART_MUTATED` | Cart write / read shows item | Inventory reservation |
+| `CHECKOUT_ENTERED` | Checkout UI loaded | Payment or accept |
+| `PLACE_ORDER_SUBMITTED` | Client sent place-order | Processing succeeded |
+| `PLACE_ORDER_HANG` | Past hang threshold, no terminal result | Cause known |
+| `CHECKOUT_BUSY` | Busy / high-demand UI | Shape vs saturation |
+| `CART_EVICTED` | Item left cart without us removing it | Edge deleted it |
+| `PAYMENT_AUTH_PENDING` | Bank/wallet hold | Order confirmed (Target: hold ≠ charge) |
+| `PAYMENT_DECLINED` | Explicit issuer/payment fail | Bot block |
+| `ORDER_ACKNOWLEDGED` | Request received | Accepted / available / shipped |
+| `ORDER_CONFIRMED` | Confirmation + order id | Final fulfillment |
+| `BUSINESS_RULE_DENIED` | Qty / address / account policy message | Shape |
+
+Saturation layers that look similar: edge mitigation, auth/session, cart/inventory reconciliation, checkout queue, payment/order commit. OWASP: holding scarce goods without purchase ≠ DoS of servers.
+
+### Attribution cheat sheet
+
+| Cluster | Lean edge/telemetry | Lean commerce |
+|---------|---------------------|---------------|
+| ATC before suspected telemetry; fast deny; no cart change | Higher | Still possible |
+| Cart OK, later only scarce SKU vanishes | Weak | Inventory / cart reconcile |
+| Broad slow/busy across checkout | Possible | Saturation / dependency |
+| Explicit payment decline / qty message | Weak | Payment / business rule |
+| Generic `401` / `T83072242` | **Indeterminate** | **Indeterminate** |
+| Auth hold, empty order history | Low value | Matches Target pre-auth docs |
+
+Log with **confidence + alternatives**; don’t code Discord “bot protection” as fact.
+
+### Our live probes
+
+| Signal | Result |
+|--------|--------|
+| Redsky stock | Often works while writes fail |
+| Desktop `cart_items` | Repeated `401 T83072242` — indeterminate layer; weak vs mobile ATC consensus |
+| Mobile ATC | Consensus path for cart under drop load |
+| PC `/checkout` + F5 | Cart may hydrate late; then Place order clicker |
+| Qty | Prefer **2** for FP3; set **after** Shipping cell on web |
+| Login / Sign in to buy | Soft-block from OTP spam; don’t auto Sign-in if ATC exists |
+
+### Bot strategy (ops)
+
+1. Prefer **mobile cart** when desktop ATC is denied; same account on PC for checkout.
+2. PC: `/checkout` → reload until Place order ready → clicker-paced Place order (stop on sold-out / `CART_EVICTED`).
+3. Desktop ATC: in-page only after buy-box ready; paced cool on `AUTH_DENIED`; no header forge.
+4. Outcome codes above in logs so edge vs commerce stay separated.
+
+### Useful next measurements (when you want data)
+
+- Control-SKU HAR: `TELEM_BEFORE_ATC` rate vs outcome (header **and** body shape, names only).
+- Cookie-name / age bands at ATC — not values.
+- Web vs app symptom matrix (separate channels).
+
 ## Configs
 
 | File | Use |
 |------|-----|
 | [`configs/target/default.json`](../configs/target/default.json) | Default product set |
-| `tonight.json` | Drop-night SKU / qty |
+| `tonight.json` | Drop-night SKU / qty / Place-order window |
 | `smoke.json` / `shipping-smoke.json` | ATC / shipping dry-runs |
 | `live-buy.json` | Intentional buy profile |
-
-### Important fields
 
 | Field | Meaning |
 |-------|---------|
 | `items[].url` | Target PDP (`/A-TCIN`) |
-| `items[].max_quantity` | Desired ATC qty |
-| `items[].enabled` | Skip without deleting |
-| `refresh_interval_seconds` | Base OOS poll wait |
-| `prefer_pickup` | Default **false** (prefer shipping) |
-| `preferred_store_name` | Pickup store label |
-| `dry_run` / `place_order` | Safety: keep dry_run until you mean it |
+| `items[].max_quantity` | PDP qty target (FP3 consensus used **2**) |
+| `place_order_spam_seconds` | Place order clicker window after cart (default 1800) |
+| `dry_run` / `place_order` | Safety |
 
-## Field notes — 2026-08-07 (live drops)
-
-Logs under `~/.scalping/logs/target/` (not committed).
-
-### Soft-block / session
-
-- Spam Continue / Get a code → Target banner **“Something went wrong on our end”** on login (bot **and** manual in same profile).
-- Auto-login must **stop** on that banner; CLI must not crash when Botasaurus returns `null`.
-- Fix that worked: wipe `~/.scalping/chrome-profiles/target` + `target_cookies.json`, then `sessions/wait_for_login.py` once. Session `--check` → `signed_in: true`.
-
-### SKUs probed tonight
-
-| TCIN | Product | Stock signals | ATC API | Notes |
-|------|---------|---------------|---------|-------|
-| `1011209273` | Mega Greninja ex Premium | Often DOM OOS while Redsky `ship=IN_STOCK` | All variants `401 T83072242` | Buy-box lag vs API; `cart_views` warm `200` |
-| `1011483406` | Pitch Black ETB | **Stable** DOM + API `IN_STOCK` (60/60 in throttled run) | API **30/30** `401 T83072242`; UI hook same | Throttle working (54 stock-only vs 6 ATC probes). `cart_views` **200** with intermittent **429**. UI fetch body uses **`channel_id`/`item_channel_id` `"90"`** + `fulfillment_test_mode` — still AUTH_DENIED. `add_to_cart` can return ok=True while hooked call is 401 (false success). |
-
-Affiliate PDP examples: [Greninja `A-1011209273`](https://www.target.com/p/zephyr/-/A-1011209273), [Pitch Black ETB `A-1011483406`](https://www.target.com/p/zephyr/-/A-1011483406).
-
-### Progressive notes
-
-- **~02:20 MT** — Pitch Black stayed buyable; direct `cart_items` never cleared AUTH_DENIED; over-probe fixed via `--atc-every`.
-- **~02:30 MT** — Throttled session: stock solid; UI ATC captured live body with channel **`"90"`** (not desktop `"10"`) under our desktop UA — mismatch or page A/B. Treat UI `ok` without `last_cart_call.status==2xx` as failure.
-
-### Chaos Rising earlier (`A-95298172` / blister `95298174`)
-
-Full dump: `~/.scalping/logs/target/deep_probe_95298172_*.json`
-
-| Signal | Result |
-|--------|--------|
-| Stock | `product_summary_with_fulfillment_v1` + `product_fulfillment_v1` → ship `IN_STOCK` |
-| Retired | `pdp_fulfillment_v1` → **410** |
-| Real UI ATC body | `channel_id` / `item_channel_id` **`"10"`** on desktop (mobile may use `"90"`) |
-| Cart write | `T83072242` / `_ERR_AUTH_DENIED` — PerimeterX (`_px*`) + `__CONFIG__.shape.enabled` |
-| Checkout APIs | Guest `pre_checkout` / `checkout` → `403 INVALID_GUEST_STATUS` |
-| `cart_views` | `204` empty guest; `200` with cart; can **429** under load |
-
-### Traffic / bot-score patterns
-
-1. **Reads succeed, writes fail** — Redsky stock + often `cart_views` OK; `cart_items` POST returns `_ERR_AUTH_DENIED` even when UI shows Add to cart / signed in.
-2. **DOM ≠ API** — drop pages flip; buy-box can stay “Out of stock” while fulfillment API says `IN_STOCK` (and the reverse). Poll both.
-3. **Shape + PX** — `__CONFIG__.shape.enabled`; cookies include `_pxhd` / related. Payload shape alone doesn’t clear AUTH_DENIED.
-4. **Self-inflicted pressure** — parallel ATC / login spam worsens soft-block and 429s. Gentle poll + spaced ATC probes.
-5. **Desktop UA** — prefer real Chrome UA + channel `"10"`; mobile UA spoof on Chromium correlated with worse cart scores earlier.
-
-### How to improve (priority)
-
-1. **Healthy signed-in session** — don’t spam login; wipe profile if soft-blocked.
-2. **UI-first ATC** with fetch hook — capture real `cart_items` request/response; API variants only as sparse backup.
-3. **Dual stock** — Redsky + buy-box; don’t trust one.
-4. **429 / AUTH_DENIED** — long cool + PDP reload for sensors; never parallel `cart_items`.
-5. **Verify cart** — require cart line / badge, not `cart_looks_updated` alone after 401 storms.
-6. **Data hunt** — `hunt_data --no-checkout`; keep `place_order: false` unless explicitly buying.
 ## Session
 
 ```bash
@@ -97,61 +131,25 @@ Full dump: `~/.scalping/logs/target/deep_probe_95298172_*.json`
 ./scripts/session-target.sh --force
 ```
 
-Uses `GMAIL_LOGIN` + `GMAIL_APP_PASSWORD`. Profile: `~/.scalping/chrome-profiles/target`.
+Profile: `~/.scalping/chrome-profiles/target`. Uses `GMAIL_LOGIN` + `GMAIL_APP_PASSWORD`.
 
-**Do not spam login.** If Target shows “Something went wrong on our end”, wait several minutes and run `session-target.sh --force` **once**. Auto-login now stops on that banner (max ~3 gentle Get a code clicks). Diagnose / hunt_data skip auto-login on purpose.
-
-
-## Run flags
+## Run
 
 ```bash
-./scripts/run-target.sh
-./scripts/run-target.sh --sequential
-./scripts/run-target.sh --parallel
-./scripts/run-target.sh --max-attempts 3
-./scripts/run-target.sh --place-order
-./scripts/run-target.sh --no-clear-cart
+./scripts/run-target.sh --config configs/target/tonight.json --place-order --max-attempts 50
+uv run python -m scalping.bots.target.hunt_data --config configs/target/tonight.json --no-checkout
 ```
 
-## Drop ATC strategies
-
-Under load, desktop UI “Add to cart” often clicks but never lands (same failure mode many people hit on drops). The bot uses several paths that share the signed-in Chrome session cookies:
-
-1. **Cart API (sequential)** (`POST carts.target.com/web_checkouts/v1/cart_items`)  
-   Prefer live PDP shape: desktop `channel_id` / `item_channel_id` **`"10"`** (captured from real Add to cart).  
-   Fallbacks: Tempo / `"90"` / `fulfillment_test_mode`. Rotate one request at a time.  
-   Always try **qty=1 first**, then bump.  
-   Do **not** send `fulfillment.type: SHIPPING`. Do **not** parallelize POSTs (self-429).
-2. **`T83072242` / `_ERR_AUTH_DENIED`** — Target bot/edge block (same family as login blocks).  
-   `cart_views` can still be 200. Cool down; prefer real UI click (same payload path).
-3. **Warm `cart_views`** before ATC.
-4. **429 backoff** — wait 1–8s, then UI.
-5. **Desktop Chrome UA** + buy-box UI first (avoid mobile spoof on Chromium).
-6. **Soft-fail ATC** — keep polling.
-7. **Stock via Redsky in-browser**.
-
-Diagnose dump: `uv run python -m scalping.bots.target.diagnose --config configs/target/tonight.json`  
 Logs: `~/.scalping/logs/target/`.
-
-Code: `scalping/bots/target/api.py` (cart + redsky), wired from `stock.add_to_cart` and `cli` poll loop.
 
 ## Modules
 
 | Module | Role |
 |--------|------|
-| `scalping/bots/target/config.py` | Load JSON + `.env` |
-| `scalping/bots/target/api.py` | Cart API burst + Redsky stock poll |
-| `scalping/bots/target/stock.py` | Buy-box stock + ATC orchestration |
-| `scalping/bots/target/checkout.py` | Cart, auth, fulfillment, checkout |
-| `scalping/bots/target/session.py` | Login / cookies |
-| `scalping/bots/target/cli.py` | Poll loop + CLI |
-| `scalping/bots/target/bot.py` | Platform adapter |
-
-## Tests
-
-```bash
-uv run python -m pytest tests/test_config_and_stock.py -q
-uv run python -m pytest tests/test_target_live.py -m live -s
-```
+| `api.py` | Redsky + sequential cart API (sparse backup only) |
+| `stock.py` | Buy-box stock + UI-first ATC |
+| `checkout.py` | Cart, auth, `/checkout` F5 hydrate, Place order clicker |
+| `session.py` | Login / cookies |
+| `cli.py` | Poll loop |
 
 See [CONFIGURATION.md](CONFIGURATION.md) for `.env` fields.

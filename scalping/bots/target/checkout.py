@@ -1563,6 +1563,167 @@ def wait_for_checkout_auth(driver: Driver, *, timeout_seconds: float) -> bool:
     return on_checkout_page(driver)
 
 
+def sign_in_to_buy_visible(driver: Driver) -> bool:
+    """PDP buy-box gate: signed-in header can still show 'Sign in to buy now'."""
+    try:
+        return bool(
+            driver.run_js(
+                """
+                const btn = document.querySelector('[data-test="sign-in-to-buy-now-button"]');
+                if (btn) {
+                  const r = btn.getBoundingClientRect();
+                  if (r.width > 4 && r.height > 4) return true;
+                }
+                const root = document.querySelector('[data-test="@web/AddToCart/FulfillmentSection"]');
+                const t = ((root && root.innerText) || '').toLowerCase();
+                return t.includes('sign in to buy');
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def click_sign_in_to_buy(driver: Driver) -> bool:
+    """Open the purchase step-up from the PDP buy box."""
+    disable_webauthn_prompts(driver)
+    try:
+        hit = driver.run_js(
+            """
+            const prefer = document.querySelector('[data-test="sign-in-to-buy-now-button"]');
+            const candidates = prefer
+              ? [prefer]
+              : Array.from(document.querySelectorAll('button, a, [role="button"]'));
+            for (const el of candidates) {
+              const t = ((el.innerText || el.getAttribute('aria-label') || '') + '')
+                .replace(/\\s+/g, ' ').trim().toLowerCase();
+              if (!t.includes('sign in to buy')) continue;
+              if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+              const r = el.getBoundingClientRect();
+              if (r.width < 4 || r.height < 4) continue;
+              el.scrollIntoView({block: 'center', inline: 'nearest'});
+              el.click();
+              return true;
+            }
+            return false;
+            """
+        )
+        if hit:
+            print("[AUTH] clicked Sign in to buy now")
+            time.sleep(0.6)
+            return True
+    except Exception as exc:
+        print(f"[AUTH] Sign in to buy click failed: {exc}")
+    return False
+
+
+def wait_for_pdp_purchase_auth(driver: Driver, *, timeout_seconds: float = 120.0) -> bool:
+    """Clear PDP 'Sign in to buy now' via email OTP so ATC can write the cart.
+
+    Header 'Hi, Name' is not enough — Target still gates cart writes until this
+    step-up completes. Gentle: one Sign-in click, few Get a code clicks, Gmail OTP.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from scalping.bots.target.gmail_otp import fetch_latest_target_otp, load_gmail_credentials
+
+    if not sign_in_to_buy_visible(driver) and not step_up_auth_visible(driver) and not _otp_entry_visible(driver):
+        return True
+
+    disable_webauthn_prompts(driver)
+    gmail = load_gmail_credentials()
+    code_requested_at = datetime.now(timezone.utc) - timedelta(seconds=15)
+
+    if sign_in_to_buy_visible(driver):
+        if not click_sign_in_to_buy(driver):
+            print("[AUTH] could not click Sign in to buy now")
+            return False
+
+    print("[AUTH] PDP purchase step-up — requesting email code…")
+    requested = request_email_code(driver, force_new=False)
+    if not _otp_entry_visible(driver):
+        requested = request_email_code(driver, force_new=False) or requested
+    if not requested and not _otp_entry_visible(driver) and _target_auth_error_visible(driver):
+        print("[AUTH] Target soft-blocked on PDP step-up — stop (do not spam)")
+        return False
+
+    print(
+        "\n=== TARGET PDP SIGN-IN TO BUY ===\n"
+        "Buy box requires purchase step-up (not just homepage login).\n"
+        f"Gmail auto-OTP: {'yes (' + gmail.login + ')' if gmail.is_configured else 'NO — set GMAIL_* or TARGET_OTP'}\n"
+        f"Waiting up to {int(timeout_seconds)}s...\n"
+    )
+
+    deadline = time.time() + max(15.0, timeout_seconds)
+    used_codes: set[str] = set()
+    next_gmail_poll = 0.0
+    next_resend = time.time() + 50.0
+
+    while time.time() < deadline:
+        if not sign_in_to_buy_visible(driver) and not step_up_auth_visible(driver) and not _otp_entry_visible(driver):
+            clear_target_otp()
+            print("[AUTH] PDP purchase gate cleared")
+            return True
+
+        if _target_auth_error_visible(driver) and not _otp_entry_visible(driver):
+            print("[AUTH] error banner on PDP step-up — stopping (wait / manual)")
+            return False
+
+        entry_up = _otp_entry_visible(driver)
+        auth_up = step_up_auth_visible(driver) or entry_up or sign_in_to_buy_visible(driver)
+
+        otp = read_target_otp()
+        if gmail.is_configured and time.time() >= next_gmail_poll:
+            next_gmail_poll = time.time() + 0.35
+            try:
+                gmail_otp = fetch_latest_target_otp(gmail, newer_than=code_requested_at)
+            except Exception as exc:
+                print(f"[GMAIL] poll error: {exc}")
+                gmail_otp = None
+            if gmail_otp and gmail_otp not in used_codes:
+                print(f"[GMAIL] using code ending …{gmail_otp[-2:]}")
+                otp = gmail_otp
+
+        if auth_up and otp and len(otp) >= 4 and otp not in used_codes:
+            print(f"[AUTH] Submitting PDP OTP ({len(otp)} digits)")
+            if submit_otp(driver, otp):
+                used_codes.add(otp)
+                clear_target_otp()
+                time.sleep(0.8)
+                if not sign_in_to_buy_visible(driver) and not _otp_entry_visible(driver):
+                    print("[AUTH] PDP purchase gate cleared after OTP")
+                    return True
+                # Modal may need one more Sign in to buy / Get a code cycle.
+                if sign_in_to_buy_visible(driver):
+                    click_sign_in_to_buy(driver)
+                continue
+            print("[AUTH] OTP not accepted yet — will retry")
+            time.sleep(0.4)
+            continue
+
+        if entry_up and time.time() >= next_resend:
+            print("[AUTH] still waiting for email — one resend")
+            code_requested_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+            if not request_email_code(driver, force_new=True):
+                next_resend = time.time() + 90.0
+            else:
+                next_resend = time.time() + 55.0
+        elif sign_in_to_buy_visible(driver) and not entry_up and time.time() >= next_resend:
+            click_sign_in_to_buy(driver)
+            request_email_code(driver, force_new=False)
+            next_resend = time.time() + 55.0
+        elif (not entry_up) and auth_up and time.time() >= next_resend:
+            code_requested_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+            if not request_email_code(driver, force_new=False):
+                next_resend = time.time() + 90.0
+            else:
+                next_resend = time.time() + 55.0
+
+        time.sleep(0.25)
+
+    print("[AUTH] timed out on PDP Sign in to buy now")
+    return not sign_in_to_buy_visible(driver)
+
 
 def start_checkout(driver: Driver, *, wait_auth: bool = True, auth_timeout: float = 300.0) -> bool:
     clicked = click_checkout_button(driver)
@@ -1891,18 +2052,258 @@ def fill_new_card(driver: Driver, payment: PaymentInfo) -> bool:
     return filled >= 3
 
 
+def checkout_appears_stuck(driver: Driver) -> bool:
+    """Spinner / empty checkout — Discord tip: cart → checkout to refresh."""
+    try:
+        return bool(
+            driver.run_js(
+                """
+                const text = ((document.body && document.body.innerText) || '').toLowerCase();
+                if (text.includes('still loading') || text.includes('please wait')) return true;
+                if (text.includes('something went wrong') && text.includes('try again')) return true;
+                const spin = document.querySelector(
+                  '[class*="Spinner"], [class*="spinner"], [data-test*="spinner" i], '
+                  + '[aria-busy="true"], .circular-loading-indicator'
+                );
+                if (spin) {
+                  const r = spin.getBoundingClientRect();
+                  if (r.width > 8 && r.height > 8) return true;
+                }
+                // Checkout URL but no Place order and no CVV for a while → hung shell
+                const url = (location.href || '').toLowerCase();
+                if (url.includes('/checkout')) {
+                  const place = document.querySelector('[data-test="placeOrderButton"]');
+                  const cvv = document.querySelector('input[autocomplete="cc-csc"]');
+                  if (!place && !cvv && text.length < 400) return true;
+                }
+                return false;
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def checkout_ready_for_place_order(driver: Driver) -> bool:
+    """True when checkout shows cart contents / Place order (post–F5 hydrate)."""
+    try:
+        return bool(
+            driver.run_js(
+                """
+                const place = document.querySelector(
+                  '[data-test="placeOrderButton"], button[data-test*="placeOrder" i]'
+                );
+                if (place && !place.disabled && place.getAttribute('aria-disabled') !== 'true') {
+                  const r = place.getBoundingClientRect();
+                  if (r.width > 8 && r.height > 8) return true;
+                }
+                const text = ((document.body && document.body.innerText) || '').toLowerCase();
+                if (text.includes('place order') && !text.includes('your cart is empty')) {
+                  if (document.querySelector('[data-test*="cartItem" i], [data-test*="cart-item" i]')) {
+                    return true;
+                  }
+                }
+                return false;
+                """
+            )
+        )
+    except Exception:
+        return bool(driver.select('[data-test="placeOrderButton"]', 0.2))
+
+
+def reload_checkout_until_ready(
+    driver: Driver,
+    *,
+    timeout_seconds: float = 180.0,
+) -> bool:
+    """Live success path: open /checkout and F5 until cart / Place order appears.
+
+    Mobile ATC → shared account cart → PC www.target.com/checkout → refresh until
+    hydrated → click Place order. Stops early if cart is empty.
+    """
+    deadline = time.time() + max(15.0, timeout_seconds)
+    reloads = 0
+    try:
+        driver.get("https://www.target.com/checkout")
+    except Exception:
+        pass
+    time.sleep(0.6)
+    print(
+        f"[CHECKOUT] F5 until cart/Place order ready "
+        f"(up to {int(timeout_seconds)}s)"
+    )
+    while time.time() < deadline:
+        if checkout_order_blocked(driver):
+            print("[CHECKOUT] sold-out/unavailable while waiting for hydrate")
+            return False
+        if cart_is_empty(driver) and "checkout" in (driver.current_url or "").lower():
+            # Empty checkout page vs not-yet-loaded — only bail after a few reloads.
+            if reloads >= 4:
+                text = _page_lower(driver)
+                if "cart is empty" in text or "your cart is empty" in text:
+                    print("[CHECKOUT] cart empty on checkout — abort hydrate")
+                    return False
+        if checkout_ready_for_place_order(driver):
+            print(f"[CHECKOUT] ready after {reloads} reloads")
+            return True
+        reloads += 1
+        if reloads == 1 or reloads % 8 == 0:
+            print(f"[CHECKOUT] reload #{reloads} (waiting for cart hydrate)")
+        try:
+            driver.refresh()
+        except Exception:
+            try:
+                driver.get("https://www.target.com/checkout")
+            except Exception:
+                pass
+        time.sleep(0.45 + random.uniform(0.1, 0.35))
+    print(f"[CHECKOUT] hydrate timed out after {reloads} reloads")
+    return checkout_ready_for_place_order(driver)
+
+
+def refresh_cart_then_checkout(driver: Driver) -> bool:
+    """When checkout spins: cart → checkout, else plain /checkout reload."""
+    print("[CHECKOUT] refreshing via cart → checkout")
+    try:
+        go_to_cart(driver)
+        time.sleep(0.35 + random.uniform(0.1, 0.3))
+    except Exception:
+        try:
+            driver.get("https://www.target.com/cart")
+            time.sleep(0.5)
+        except Exception:
+            pass
+    if cart_is_empty(driver):
+        print("[CHECKOUT] cart empty after refresh — abort")
+        return False
+    click_checkout_button(driver)
+    time.sleep(0.4)
+    if not on_checkout_page(driver):
+        try:
+            driver.get("https://www.target.com/checkout")
+            time.sleep(0.5)
+        except Exception:
+            pass
+    return on_checkout_page(driver) or checkout_ready_for_place_order(driver)
+
+
 def place_order(driver: Driver) -> bool:
+    """Single Place order click (see spam_place_order for clicker-style retries)."""
     for selector in (
         '[data-test="placeOrderButton"]',
         'button[data-test*="placeOrder" i]',
         'button[data-test*="place-order" i]',
     ):
-        if _js_click(driver, selector) or _click_selector(driver, selector, wait=0.5):
-            driver.sleep(0.45)
+        if _js_click(driver, selector) or _click_selector(driver, selector, wait=0.15):
             return True
-    return _click_text(driver, "Place order", wait=0.7) or _click_text(
-        driver, "Place my order", wait=0.4
+    return _click_text(driver, "Place order", wait=0.25) or _click_text(
+        driver, "Place my order", wait=0.2
     )
+
+
+def checkout_order_blocked(driver: Driver) -> bool:
+    """True when inventory/traffic killed the order (stop spamming)."""
+    text = _page_lower(driver)
+    return any(
+        token in text
+        for token in (
+            "no longer available",
+            "out of stock",
+            "sold out",
+            "item is unavailable",
+            "removed from your cart",
+            "can't place your order",
+            "cannot place your order",
+            "payment could not be authorized",
+            "sorry, this item is no longer",
+        )
+    )
+
+
+def spam_place_order(
+    driver: Driver,
+    *,
+    timeout_seconds: float = 1800.0,
+    payment: PaymentInfo | None = None,
+) -> tuple[bool, str | None]:
+    """Clicker-style Place order until confirm, sold-out, or timeout.
+
+    Mirrors live success: Free Mouse Clicker on Place order after /checkout
+    hydrates. Fast clicks (~100–200ms). If the button disappears, F5 /checkout.
+    """
+    timeout_seconds = max(15.0, float(timeout_seconds))
+    deadline = time.time() + timeout_seconds
+    clicks = 0
+    refreshes = 0
+    last_refresh = 0.0
+    print(
+        f"[ORDER] Place order clicker-style for up to {int(timeout_seconds)}s "
+        f"(~8–10 clicks/s when button visible; stop on sold-out)"
+    )
+    while time.time() < deadline:
+        confirmed, order_number = order_confirmation(driver)
+        if confirmed:
+            print(
+                f"[ORDER] confirmed after {clicks} Place order clicks "
+                f"({refreshes} refreshes)"
+            )
+            return True, order_number
+        if checkout_order_blocked(driver):
+            print(f"[ORDER] blocked/sold-out after {clicks} clicks — stopping")
+            return False, None
+
+        now = time.time()
+        ready = checkout_ready_for_place_order(driver)
+        if (not ready or checkout_appears_stuck(driver)) and (now - last_refresh) > 3.0:
+            # Proven path: F5 on /checkout until Place order is back.
+            try:
+                if "checkout" in (driver.current_url or "").lower():
+                    driver.refresh()
+                else:
+                    driver.get("https://www.target.com/checkout")
+            except Exception:
+                if not refresh_cart_then_checkout(driver):
+                    if cart_is_empty(driver):
+                        return False, None
+            refreshes += 1
+            last_refresh = now
+            time.sleep(0.35)
+            if payment and payment.is_complete:
+                try:
+                    fill_payment(driver, payment)
+                except Exception:
+                    if payment.card_cvv:
+                        fill_cvv(driver, payment.card_cvv)
+            continue
+
+        if place_order(driver):
+            clicks += 1
+            if clicks == 1 or clicks % 50 == 0:
+                elapsed = int(time.time() - (deadline - timeout_seconds))
+                print(
+                    f"[ORDER] Place order #{clicks} "
+                    f"(~{elapsed}s elapsed, refreshes={refreshes})"
+                )
+        # Mouse-clicker pace (not ATC Shape mash).
+        time.sleep(0.08 + random.uniform(0.02, 0.08))
+
+        if payment and payment.card_cvv and clicks and clicks % 40 == 0:
+            try:
+                page = _page_lower(driver)
+                if "cvv" in page or "security code" in page:
+                    fill_cvv(driver, payment.card_cvv)
+            except Exception:
+                pass
+
+    confirmed, order_number = order_confirmation(driver)
+    if confirmed:
+        print(f"[ORDER] confirmed after {clicks} Place order clicks")
+        return True, order_number
+    print(
+        f"[ORDER] Place order timed out after {clicks} clicks / {refreshes} refreshes "
+        f"({int(timeout_seconds)}s)"
+    )
+    return False, order_number
 
 
 def order_confirmation(driver: Driver) -> tuple[bool, str | None]:
@@ -2066,12 +2467,21 @@ def choose_fulfillment_and_checkout(driver: Driver, config: AppConfig) -> Checko
     # Auth can leave us on /cart — force the real checkout UI before payment.
     if not on_checkout_page(driver):
         if not ensure_reached_checkout(driver):
-            return CheckoutResult(
-                fulfillment=fulfillment,
-                dry_run=config.dry_run,
-                placed_order=False,
-                message="Authenticated but could not open checkout page",
-            )
+            # Live success path: go straight to /checkout and F5 until ready.
+            if not reload_checkout_until_ready(driver, timeout_seconds=min(120.0, auth_timeout)):
+                return CheckoutResult(
+                    fulfillment=fulfillment,
+                    dry_run=config.dry_run,
+                    placed_order=False,
+                    message="Authenticated but could not open checkout page",
+                )
+
+    # Cart from mobile ATC may take F5s to hydrate on PC checkout.
+    if not checkout_ready_for_place_order(driver):
+        reload_checkout_until_ready(
+            driver,
+            timeout_seconds=min(180.0, max(60.0, auth_timeout)),
+        )
 
     if fulfillment == FulfillmentChoice.SHIPPING:
         ensure_shipping_address(driver, config.shipping_address)
@@ -2108,15 +2518,11 @@ def choose_fulfillment_and_checkout(driver: Driver, config: AppConfig) -> Checko
             message="Could not fill payment / CVV on checkout page",
         )
 
-    if not place_order(driver):
-        return CheckoutResult(
-            fulfillment=fulfillment,
-            dry_run=False,
-            placed_order=False,
-            message="Failed to click Place order",
-        )
-
-    confirmed, order_number = order_confirmation(driver)
+    # Clicker-style Place order (mobile ATC → PC /checkout F5 → mash Place order).
+    spam_timeout = float(getattr(config, "place_order_spam_seconds", 0) or 0) or 1800.0
+    confirmed, order_number = spam_place_order(
+        driver, timeout_seconds=spam_timeout, payment=config.payment
+    )
     if confirmed:
         return CheckoutResult(
             fulfillment=fulfillment,
@@ -2125,11 +2531,18 @@ def choose_fulfillment_and_checkout(driver: Driver, config: AppConfig) -> Checko
             message=f"Order confirmed{f' #{order_number}' if order_number else ''}",
             order_number=order_number,
         )
-
+    if order_number:
+        return CheckoutResult(
+            fulfillment=fulfillment,
+            dry_run=False,
+            placed_order=True,
+            message="Place order finished — possible order (check email/Target)",
+            order_number=order_number,
+        )
     return CheckoutResult(
         fulfillment=fulfillment,
         dry_run=False,
-        placed_order=True,
-        message="Place order clicked (confirmation page not detected yet — check email/Target orders)",
-        order_number=order_number,
+        placed_order=False,
+        message="Place order timed out / blocked — no confirmation",
+        order_number=None,
     )
