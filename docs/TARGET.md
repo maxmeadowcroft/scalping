@@ -51,9 +51,13 @@ Logs under `~/.scalping/logs/target/` (not committed).
 | TCIN | Product | Stock signals | ATC API | Notes |
 |------|---------|---------------|---------|-------|
 | `1011209273` | Mega Greninja ex Premium | Often DOM OOS while Redsky `ship=IN_STOCK` | All variants `401 T83072242` | Buy-box lag vs API; `cart_views` warm `200` |
-| `1011483406` | Pitch Black ETB | DOM + API `IN_STOCK` (shipping button seen) | All variants `401 T83072242` | `cart_views` hit **429** during buyable wave; hunt reported cart `landed` after clears — treat as **suspect** until UI fetch hook confirms |
+| `1011483406` | Pitch Black ETB | **Stable** DOM + API `IN_STOCK` (~19/19 polls) | **90/90** `401 T83072242` across all variants | `cart_views` warm mostly **200** after early 429; `cart_looks_updated` false-positives skip UI ATC — cart_empty flip-flops |
 
 Affiliate PDP examples: [Greninja `A-1011209273`](https://www.target.com/p/zephyr/-/A-1011209273), [Pitch Black ETB `A-1011483406`](https://www.target.com/p/zephyr/-/A-1011483406).
+
+### Progressive note (~02:20 MT)
+
+Pitch Black stayed buyable for ~15+ minutes with shipping ATC button visible. Direct `cart_items` never cleared AUTH_DENIED. Hunt was over-probing (5 variants × every buyable poll) — throttle ATC probes; stock-only most ticks.
 
 ### Chaos Rising earlier (`A-95298172` / blister `95298174`)
 

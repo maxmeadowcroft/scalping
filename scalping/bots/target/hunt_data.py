@@ -119,6 +119,10 @@ def run_hunt(driver: Driver, data: dict):
     atc_ok_count = 0
     last_statuses: list[str] = []
     purchased = False
+    # Sparse ATC: stock every poll; cart writes only on this cadence (avoid PX burn).
+    atc_probe_every_s = float(data.get("atc_probe_every_s") or 60.0)
+    last_atc_probe_at = 0.0
+    auth_denied_streak = 0
 
     while (time.time() - started) < max_minutes * 60:
         poll_n += 1
@@ -176,7 +180,24 @@ def run_hunt(driver: Driver, data: dict):
             continue
 
         in_stock_hits += 1
-        print(f"[HUNT] BUYABLE hit #{in_stock_hits} — collecting ATC data")
+        now = time.time()
+        due_for_atc = (now - last_atc_probe_at) >= atc_probe_every_s
+        if not due_for_atc:
+            _append_event(
+                ndjson,
+                {
+                    "t": _ts(),
+                    "event": "buyable_stock_only",
+                    "n": poll_n,
+                    "hit": in_stock_hits,
+                    "next_atc_in_s": round(atc_probe_every_s - (now - last_atc_probe_at), 1),
+                },
+            )
+            time.sleep(poll_s)
+            continue
+
+        last_atc_probe_at = now
+        print(f"[HUNT] BUYABLE hit #{in_stock_hits} — sparse ATC probe")
         _append_event(
             ndjson,
             {
@@ -208,42 +229,51 @@ def run_hunt(driver: Driver, data: dict):
             )
             if res.ok:
                 atc_ok_count += 1
+                auth_denied_streak = 0
                 break
-            wait = 2.5 if res.status == 429 else (3.5 if res.status == 401 else 1.0)
+            wait = 2.5 if res.status == 429 else (1.5 if res.status == 401 else 0.8)
             time.sleep(wait)
             if res.status in (429, 401):
-                open_product(driver, item, force_navigate=True)
-                time.sleep(0.6)
-                _install_cart_fetch_hook(driver)
+                # One reload mid-burst is enough; don't reload after every variant.
+                if variant == VARIANT_ORDER[0]:
+                    open_product(driver, item, force_navigate=True)
+                    time.sleep(0.5)
+                    _install_cart_fetch_hook(driver)
 
         _append_event(
             ndjson,
             {"t": _ts(), "event": "atc_variants", "results": variant_results},
         )
+        if variant_results and all(
+            (not r.get("ok")) and r.get("status") == 401 for r in variant_results
+        ):
+            auth_denied_streak += 1
+        elif any(r.get("ok") for r in variant_results):
+            auth_denied_streak = 0
 
-        # 2) UI path with fetch hook (even if API failed — capture page fetch).
-        if not cart_looks_updated(driver):
-            print("[HUNT] UI ATC path…")
-            ui_ok = add_to_cart(driver, item, prefer_pickup=config.prefer_pickup)
-            last = _last_cart_call(driver)
-            _append_event(
-                ndjson,
-                {
-                    "t": _ts(),
-                    "event": "atc_ui",
-                    "ok": ui_ok,
-                    "last_cart_call": _safe(last),
-                    "looks_updated": cart_looks_updated(driver),
-                    "buybox_after": _safe(_buybox_stock_probe(driver)),
-                    "cart_warm_after": _safe(warm_cart_session(driver)),
-                },
-            )
-            print(f"[HUNT] UI ATC ok={ui_ok} last_call={last}")
-            if ui_ok:
-                atc_ok_count += 1
+        # 2) Always try UI path when probing — don't trust cart_looks_updated alone.
+        print("[HUNT] UI ATC path…")
+        ui_ok = add_to_cart(driver, item, prefer_pickup=config.prefer_pickup)
+        last = _last_cart_call(driver)
+        _append_event(
+            ndjson,
+            {
+                "t": _ts(),
+                "event": "atc_ui",
+                "ok": ui_ok,
+                "last_cart_call": _safe(last),
+                "looks_updated": cart_looks_updated(driver),
+                "buybox_after": _safe(_buybox_stock_probe(driver)),
+                "cart_warm_after": _safe(warm_cart_session(driver)),
+            },
+        )
+        print(f"[HUNT] UI ATC ok={ui_ok} last_call={last}")
+        if ui_ok:
+            atc_ok_count += 1
+            auth_denied_streak = 0
 
-        landed = cart_looks_updated(driver)
-        if landed or atc_ok_count:
+        # Only visit cart when a path claimed success (avoid false "landed" noise).
+        if ui_ok or any(r.get("ok") for r in variant_results):
             dismiss_post_atc_modals(driver)
             open_cart_after_atc(driver)
             go_to_cart(driver)
@@ -251,7 +281,13 @@ def run_hunt(driver: Driver, data: dict):
             empty = cart_is_empty(driver)
             _append_event(
                 ndjson,
-                {"t": _ts(), "event": "cart_check", "empty": empty, "landed": landed},
+                {
+                    "t": _ts(),
+                    "event": "cart_check",
+                    "empty": empty,
+                    "landed": True,
+                    "via": "ok_path",
+                },
             )
             print(f"[HUNT] cart empty={empty}")
             if not empty and try_checkout and config.place_order:
@@ -273,14 +309,21 @@ def run_hunt(driver: Driver, data: dict):
                     purchased = True
                     break
             elif not empty and try_checkout:
-                # Dry capture of cart state only
                 _append_event(ndjson, {"t": _ts(), "event": "in_cart_no_place_order"})
                 print("[HUNT] item in cart — stopping for data (no place_order)")
                 break
 
-        # After a buyable wave, cool down before next stock poll (avoid 429 hole).
-        cool = 8.0 if any(r.get("status") == 429 for r in variant_results) else 3.0
-        print(f"[HUNT] post-buyable cool {cool}s")
+        # Cool harder after AUTH_DENIED storms so stock polls can continue safely.
+        if any(r.get("status") == 429 for r in variant_results):
+            cool = 20.0
+        elif auth_denied_streak:
+            cool = min(90.0, 30.0 + 15.0 * (auth_denied_streak - 1))
+            atc_probe_every_s = max(atc_probe_every_s, cool)
+        else:
+            cool = 8.0
+        print(
+            f"[HUNT] post-atc cool {cool}s (auth_denied_streak={auth_denied_streak})"
+        )
         time.sleep(cool)
         open_product(driver, item, force_navigate=True)
         time.sleep(0.5)
@@ -309,6 +352,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--poll", type=float, default=None)
     parser.add_argument("--max-minutes", type=float, default=90)
     parser.add_argument(
+        "--atc-every",
+        type=float,
+        default=60.0,
+        help="Seconds between cart_items / UI ATC probes while buyable (stock polls continue)",
+    )
+    parser.add_argument(
         "--no-checkout",
         action="store_true",
         help="Collect ATC data only; never place order even if config says so",
@@ -325,6 +374,7 @@ def main(argv: list[str] | None = None) -> None:
             "config": config,
             "poll": args.poll,
             "max_minutes": args.max_minutes,
+            "atc_probe_every_s": args.atc_every,
             "try_checkout": (not args.no_checkout) and bool(config.place_order),
             "clear_cart_first": not args.no_clear_cart,
         }
