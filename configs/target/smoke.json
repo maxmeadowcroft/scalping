@@ -1,0 +1,34 @@
+{
+  "refresh_interval_seconds": 0.25,
+  "refresh_jitter_seconds": 0.05,
+  "max_atc_retries": 3,
+  "dry_run": true,
+  "place_order": false,
+  "prefer_pickup": false,
+  "preferred_store_name": "Albuquerque Wyoming",
+  "checkout_auth_timeout_seconds": 60,
+  "parallel": false,
+  "shipping_address": {
+    "name": "Maximus Meadowcroft",
+    "street": "3604 Garcia St NE",
+    "street2": "",
+    "city": "Albuquerque",
+    "state": "NM",
+    "zip": "87111",
+    "phone": "5757704468"
+  },
+  "items": [
+    {
+      "url": "https://www.target.com/p/drizzilicious-lemon-drizzled-mini-rice-cake-4oz/-/A-95049011",
+      "max_quantity": 2,
+      "label": "smoke-rice-cake",
+      "enabled": true
+    },
+    {
+      "url": "https://www.target.com/p/-/A-1011960739",
+      "max_quantity": 5,
+      "label": "pokemon-first-partner-s3",
+      "enabled": false
+    }
+  ]
+}

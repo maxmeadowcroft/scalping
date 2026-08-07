@@ -2,15 +2,10 @@
 
 Examples
 --------
-# Plumbing test against the current URL (no solver needed):
-./scraping/run_round1.sh --probe
-
-# Also buy a Turnstile token and see if /campaigns/start returns a session:
-./scraping/run_round1.sh --probe --solve
-
-# Live: poll until page ready, solve Turnstile, submit all entries:
-./scraping/run_round1.sh
-./scraping/run_round1.sh --dry-run   # query_only=true (no real entry if API allows)
+./scripts/run-round1.sh --probe
+./scripts/run-round1.sh --probe --solve
+./scripts/run-round1.sh
+./scripts/run-round1.sh --dry-run
 """
 
 from __future__ import annotations
@@ -21,7 +16,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from scraping.round1_api import (
+from scalping.bots.round1.api import (
     load_round1_config,
     pick_location,
     poll_until_ready,
@@ -36,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
         "--config",
         type=Path,
         default=None,
-        help="Path to configuration.round1.json",
+        help="Path to Round1 config JSON (default: configs/round1/default.json)",
     )
     parser.add_argument(
         "--probe",

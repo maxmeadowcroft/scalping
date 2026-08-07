@@ -2,7 +2,7 @@
 
 Architecture
 ------------
-Each enabled item in configuration.json is monitored independently:
+Each enabled item in the Target config JSON is monitored independently:
 
 1. Clear the cart so leftover lines do not mix into this purchase.
 2. Open the product detail page (PDP).
@@ -25,15 +25,15 @@ from pathlib import Path
 
 from botasaurus.browser import Driver, browser
 
-from scraping.config import AppConfig, ItemConfig, load_config
-from scraping.runtime import (
+from scalping.bots.target.config import AppConfig, ItemConfig, load_config
+from scalping.bots.target.runtime import (
     CHROME_ADD_ARGUMENTS,
     PROFILE_DIR,
     parallel_profile_dir,
     prepare_browser_profile,
     prepare_runtime,
 )
-from scraping.target_checkout import (
+from scalping.bots.target.checkout import (
     CheckoutResult,
     cart_has_items,
     cart_line_count,
@@ -42,7 +42,7 @@ from scraping.target_checkout import (
     open_cart_after_atc,
     trim_cart_to_max_lines,
 )
-from scraping.target_stock import (
+from scalping.bots.target.stock import (
     StockStatus,
     add_to_cart,
     check_stock,
@@ -64,7 +64,7 @@ class ItemRunResult:
 
 
 def _sleep_poll(config: AppConfig) -> None:
-    base = max(0.25, float(config.refresh_interval_seconds))
+    base = max(0.15, float(config.refresh_interval_seconds))
     jitter = max(0.0, float(config.refresh_jitter_seconds))
     delay = base + (random.uniform(0, jitter) if jitter else 0.0)
     time.sleep(delay)
@@ -322,7 +322,7 @@ def main(argv: list[str] | None = None) -> None:
         "--config",
         type=Path,
         default=None,
-        help="Path to configuration.json (default: scraping/configuration.json)",
+        help="Path to Target config JSON (default: configs/target/default.json)",
     )
     parser.add_argument(
         "--parallel",
@@ -355,6 +355,16 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Skip clearing the cart before each item (not recommended)",
     )
+    parser.add_argument(
+        "--skip-login-check",
+        action="store_true",
+        help="Do not auto email-OTP login when the Target session is stale",
+    )
+    parser.add_argument(
+        "--force-login",
+        action="store_true",
+        help="Force a fresh Target email-OTP login before monitoring",
+    )
     args = parser.parse_args(argv)
 
     prepare_runtime()
@@ -374,6 +384,23 @@ def main(argv: list[str] | None = None) -> None:
         config = replace(config, parallel=False)
 
     clear_cart_first = not args.no_clear_cart
+
+    if not args.skip_login_check:
+        print("[LOGIN] ensuring Target session (email OTP if stale)…")
+        try:
+            from scalping.bots.target.session import ensure_target_session
+
+            meta = ensure_target_session(
+                force=bool(args.force_login),
+                timeout=float(config.checkout_auth_timeout_seconds or 120),
+            )
+            print(f"[LOGIN] session ready cookies={meta.get('cookie_count')}")
+        except Exception as exc:
+            raise SystemExit(
+                f"Target login failed: {exc}\n"
+                "Fix GMAIL_LOGIN / GMAIL_APP_PASSWORD, or run: "
+                "./sessions/run_target_session.sh"
+            ) from exc
 
     print(f"Items: {len(config.enabled_items)}")
     print(f"dry_run={config.dry_run} place_order={config.place_order}")
@@ -398,7 +425,7 @@ def main(argv: list[str] | None = None) -> None:
             )
 
     if not config.enabled_items:
-        raise SystemExit("No enabled items in configuration.json")
+        raise SystemExit("No enabled items in Target config")
 
     use_parallel = config.use_parallel()
     mode = "parallel (1 browser per item)" if use_parallel else "sequential (one browser)"

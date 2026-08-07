@@ -16,7 +16,7 @@ from enum import Enum
 
 from botasaurus.browser import Driver
 
-from scraping.config import ItemConfig
+from scalping.bots.target.config import ItemConfig
 
 
 class StockStatus(str, Enum):
@@ -159,7 +159,7 @@ def _fulfillment_section_text(driver: Driver) -> str:
         return ""
 
 
-def _wait_for_pdp(driver: Driver, wait: float = 1.5) -> None:
+def _wait_for_pdp(driver: Driver, wait: float = 0.9) -> None:
     try:
         driver.wait_for_element(
             '[data-test="@web/AddToCart/FulfillmentSection"], '
@@ -171,10 +171,10 @@ def _wait_for_pdp(driver: Driver, wait: float = 1.5) -> None:
             wait=max(1, int(wait)),
         )
     except Exception:
-        time.sleep(min(0.3, wait))
+        time.sleep(min(0.2, wait))
 
 
-def _wait_for_buybox_signal(driver: Driver, *, timeout: float = 1.2) -> str:
+def _wait_for_buybox_signal(driver: Driver, *, timeout: float = 0.7) -> str:
     """Poll until the fulfillment section shows a decisive stock signal."""
     elapsed = 0.0
     last = ""
@@ -214,19 +214,21 @@ def open_product(driver: Driver, item: ItemConfig, *, force_navigate: bool = Tru
 
     if force_navigate or not already_there:
         driver.get(target)
+        _wait_for_pdp(driver, wait=0.9)
     else:
         try:
             driver.reload()
         except Exception:
             driver.get(target)
+        # Reloads should resolve faster — don't sit on a long wait_for.
+        _wait_for_pdp(driver, wait=0.6)
 
-    _wait_for_pdp(driver)
     # Target sometimes restores cart from the profile; ensure we stayed on PDP.
     try:
         current = driver.current_url or ""
         if item.tcin and item.tcin not in current:
             driver.get(target)
-            _wait_for_pdp(driver)
+            _wait_for_pdp(driver, wait=0.9)
     except Exception:
         pass
 
@@ -299,6 +301,7 @@ def check_stock(
 
 
 def set_quantity(driver: Driver, quantity: int) -> None:
+    """Set PDP qty. If `quantity` isn't offered, pick the highest available option."""
     if quantity <= 1:
         return
     selectors = [
@@ -309,7 +312,7 @@ def set_quantity(driver: Driver, quantity: int) -> None:
         'input[name="quantity"]',
     ]
     for selector in selectors:
-        el = driver.select(selector, 1)
+        el = driver.select(selector, 0.35)
         if el is None:
             continue
         try:
@@ -317,13 +320,48 @@ def set_quantity(driver: Driver, quantity: int) -> None:
             return
         except Exception:
             pass
+        # <select>: choose highest option <= requested
         try:
-            # Custom picker: open then click the desired qty option
-            driver.click(selector)
-            driver.sleep(0.4)
-            if driver.get_element_with_exact_text(str(quantity), wait=1):
-                driver.click_element_containing_text(str(quantity))
+            chosen = driver.run_js(
+                f"""
+                const el = document.querySelector({selector!r});
+                if (!el || el.tagName !== 'SELECT') return null;
+                const want = {int(quantity)};
+                let best = null;
+                for (const opt of el.options) {{
+                  const n = parseInt(opt.value || opt.textContent, 10);
+                  if (!Number.isFinite(n) || n < 1) continue;
+                  if (n === want) {{ el.value = opt.value; el.dispatchEvent(new Event('change', {{bubbles:true}})); return n; }}
+                  if (n <= want && (best === null || n > best)) best = n;
+                }}
+                if (best !== null) {{
+                  for (const opt of el.options) {{
+                    const n = parseInt(opt.value || opt.textContent, 10);
+                    if (n === best) {{
+                      el.value = opt.value;
+                      el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                      return best;
+                    }}
+                  }}
+                }}
+                return null;
+                """
+            )
+            if chosen:
+                print(f"[QTY] select set to {chosen} (wanted {quantity})")
                 return
+        except Exception:
+            pass
+        try:
+            # Custom picker: open then click the desired qty option (or closest)
+            driver.click(selector)
+            time.sleep(0.12)
+            for q in range(quantity, 0, -1):
+                if driver.get_element_with_exact_text(str(q), wait=0.15):
+                    driver.click_element_containing_text(str(q))
+                    if q != quantity:
+                        print(f"[QTY] picker set to {q} (wanted {quantity})")
+                    return
         except Exception:
             pass
         try:
@@ -350,11 +388,11 @@ def _select_fulfillment_cell(driver: Driver, prefer_pickup: bool) -> str | None:
         ]
     )
     for name, selector in order:
-        if driver.select(selector, 0.4) is None:
+        if driver.select(selector, 0.2) is None:
             continue
         try:
             driver.click(selector)
-            driver.sleep(0.3)
+            time.sleep(0.08)
             return name
         except Exception:
             continue
@@ -362,12 +400,11 @@ def _select_fulfillment_cell(driver: Driver, prefer_pickup: bool) -> str | None:
 
 
 def _already_in_cart(driver: Driver) -> bool:
+    """True only when the PDP fulfillment area shows 'N in cart' with N >= 1."""
     try:
         text = _fulfillment_section_text(driver).lower()
-        if re.search(r"\d+\s+in cart", text):
-            return True
-        el = driver.get_element_containing_text("in cart", wait=0.05)
-        return el is not None
+        m = re.search(r"(\d+)\s+in cart", text)
+        return bool(m and int(m.group(1)) >= 1)
     except Exception:
         return False
 
@@ -425,7 +462,7 @@ def add_to_cart(
     driver: Driver,
     item: ItemConfig,
     *,
-    prefer_pickup: bool = True,
+    prefer_pickup: bool = False,
 ) -> bool:
     """Select fulfillment, set qty, spam Add to cart until it sticks."""
     set_quantity(driver, item.max_quantity)
@@ -501,8 +538,15 @@ def cart_looks_updated(driver: Driver) -> bool:
             return True
         if driver.select('[data-test="cartItem-checkoutButton"]', 0.12):
             return True
-        qty = driver.select('[data-test="@web/CartLinkQuantity"]', 0.12)
-        if qty is not None:
+        qty = driver.run_js(
+            """
+            const el = document.querySelector('[data-test="@web/CartLinkQuantity"]');
+            if (!el) return 0;
+            const n = parseInt((el.textContent || '').replace(/[^0-9]/g, ''), 10);
+            return Number.isFinite(n) ? n : 0;
+            """
+        )
+        if int(qty or 0) > 0:
             return True
     except Exception:
         pass

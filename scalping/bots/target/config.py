@@ -1,7 +1,7 @@
-"""Load and validate scraping/configuration.json (+ .env payment / contact).
+"""Load and validate Target bot JSON config (+ .env payment / contact).
 
-Secrets and card data live in the project-root `.env` (gitignored). Address
-defaults can live in configuration.json; env vars override when set.
+Default file: configs/target/default.json.
+Secrets live in project-root `.env` (gitignored); env vars override JSON address fields.
 """
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 TCIN_RE = re.compile(r"/A-(\d+)", re.IGNORECASE)
-DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "configuration.json"
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[3] / "configs" / "target" / "default.json"
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 @dataclass(frozen=True)
@@ -144,7 +144,7 @@ class AppConfig:
     refresh_jitter_seconds: float = 1.5
     dry_run: bool = True
     place_order: bool = False
-    prefer_pickup: bool = True
+    prefer_pickup: bool = False
     preferred_store_name: str = "Albuquerque Wyoming"
     max_atc_retries: int = 3
     checkout_auth_timeout_seconds: float = 300.0
@@ -290,7 +290,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         refresh_jitter_seconds=float(raw.get("refresh_jitter_seconds", 1.5)),
         dry_run=bool(raw.get("dry_run", True)),
         place_order=bool(raw.get("place_order", False)),
-        prefer_pickup=bool(raw.get("prefer_pickup", True)),
+        prefer_pickup=bool(raw.get("prefer_pickup", False)),
         preferred_store_name=str(
             raw.get("preferred_store_name", "Albuquerque Wyoming")
         ),

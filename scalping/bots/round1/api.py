@@ -98,9 +98,9 @@ def load_round1_config(path: Path | None = None) -> Round1Config:
     from dotenv import load_dotenv
     import os
 
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[3]
     load_dotenv(root / ".env")
-    cfg_path = path or (Path(__file__).resolve().parent / "configuration.round1.json")
+    cfg_path = path or (Path(__file__).resolve().parents[3] / "configs" / "round1" / "default.json")
     raw = json.loads(cfg_path.read_text(encoding="utf-8"))
     solver = str(raw.get("solver") or os.getenv("ROUND1_SOLVER") or "capsolver").lower()
     key = (
@@ -302,33 +302,15 @@ def poll_until_ready(config: Round1Config) -> BootData:
 
 
 def solve_turnstile(config: Round1Config, *, website_url: str, site_key: str) -> str:
-    if not config.solver_api_key:
-        raise RuntimeError(
-            "No solver API key. Set CAPSOLVER_API_KEY (or TWOCAPTCHA_API_KEY) in .env"
-        )
-    if not site_key:
-        raise RuntimeError("turnstile site_key is empty")
+    """Solve Turnstile via shared scalping.core.captcha solvers."""
+    from scalping.core.captcha import load_solver
 
-    attempts = max(1, int(config.solver_retries))
-    last_exc: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            if config.solver in {"capsolver", "cap"}:
-                token = _solve_capsolver(config.solver_api_key, website_url, site_key)
-            elif config.solver in {"2captcha", "twocaptcha", "2cap"}:
-                token = _solve_2captcha(config.solver_api_key, website_url, site_key)
-            else:
-                raise RuntimeError(
-                    f"Unknown solver={config.solver!r} (use capsolver|2captcha|none)"
-                )
-            return token
-        except Exception as exc:
-            last_exc = exc
-            print(f"[SOLVER] attempt {attempt}/{attempts} failed: {exc}")
-            if attempt < attempts:
-                time.sleep(0.4 * attempt + random.uniform(0, 0.3))
-    assert last_exc is not None
-    raise last_exc
+    solver = load_solver(
+        config.solver,
+        api_key=config.solver_api_key,
+        retries=max(1, int(config.solver_retries)),
+    )
+    return solver.solve_turnstile(website_url=website_url, site_key=site_key)
 
 
 def _solve_capsolver(api_key: str, website_url: str, site_key: str) -> str:

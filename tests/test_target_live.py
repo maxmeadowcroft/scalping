@@ -14,10 +14,10 @@ from pathlib import Path
 import pytest
 from botasaurus.browser import Driver, browser
 
-from scraping.config import AppConfig, ItemConfig, load_config
-from scraping.runtime import CHROME_ADD_ARGUMENTS, PROFILE_DIR, prepare_runtime
-from scraping.target_checkout import FulfillmentChoice, choose_fulfillment_and_checkout
-from scraping.target_stock import (
+from scalping.bots.target.config import AppConfig, ItemConfig, load_config
+from scalping.bots.target.runtime import CHROME_ADD_ARGUMENTS, PROFILE_DIR, prepare_runtime
+from scalping.bots.target.checkout import FulfillmentChoice, choose_fulfillment_and_checkout
+from scalping.bots.target.stock import (
     StockStatus,
     add_to_cart,
     check_stock,
@@ -25,7 +25,7 @@ from scraping.target_stock import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = ROOT / "scraping" / "configuration.json"
+CONFIG_PATH = ROOT / "configs" / "target" / "default.json"
 
 IN_STOCK = ItemConfig(
     url=(

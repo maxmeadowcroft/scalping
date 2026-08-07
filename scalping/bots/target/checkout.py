@@ -23,7 +23,7 @@ from enum import Enum
 
 from botasaurus.browser import Driver
 
-from scraping.config import (
+from scalping.bots.target.config import (
     AppConfig,
     PaymentInfo,
     ShippingAddress,
@@ -428,7 +428,15 @@ def trim_cart_to_max_lines(driver: Driver, max_lines: int = 1) -> int:
 def cart_has_items(driver: Driver) -> bool:
     # Fast path: header cart badge / mini-cart CTA without a full navigation.
     try:
-        if driver.select('[data-test="@web/CartLinkQuantity"]', 0.15) is not None:
+        qty = driver.run_js(
+            """
+            const el = document.querySelector('[data-test="@web/CartLinkQuantity"]');
+            if (!el) return 0;
+            const n = parseInt((el.textContent || '').replace(/[^0-9]/g, ''), 10);
+            return Number.isFinite(n) ? n : 0;
+            """
+        )
+        if int(qty or 0) > 0:
             return True
         if driver.get_element_containing_text("View cart & check out", wait=0.15):
             return True
@@ -1299,7 +1307,7 @@ def wait_for_checkout_auth(driver: Driver, *, timeout_seconds: float) -> bool:
     """
     from datetime import datetime, timedelta, timezone
 
-    from scraping.gmail_otp import fetch_latest_target_otp, load_gmail_credentials
+    from scalping.bots.target.gmail_otp import fetch_latest_target_otp, load_gmail_credentials
 
     if on_checkout_page(driver):
         return True

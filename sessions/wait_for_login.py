@@ -1,13 +1,21 @@
-"""Wait for a manual Target login, then save cookies into the bot profile."""
+"""Deprecated: prefer auto email-OTP login.
+
+  ./scripts/session-target.sh
+  ./sessions/run_target_session.sh
+  uv run python -m scalping session target
+
+This module still supports a manual browser wait if you need it.
+"""
 
 from __future__ import annotations
 
 import json
+import sys
 import time
 
 from botasaurus.browser import Driver, browser
 
-from scraping.runtime import CHROME_ADD_ARGUMENTS, COOKIES_PATH, PROFILE_DIR, prepare_runtime
+from scalping.bots.target.runtime import CHROME_ADD_ARGUMENTS, COOKIES_PATH, PROFILE_DIR, prepare_runtime
 
 
 def _signed_in(driver: Driver) -> bool:
@@ -39,7 +47,7 @@ def _signed_in(driver: Driver) -> bool:
 def wait_for_login(driver: Driver, data):
     driver.get("https://www.target.com/login")
     print("\n" + "=" * 60)
-    print("TARGET RE-LOGIN")
+    print("TARGET RE-LOGIN (manual — prefer ./scripts/session-target.sh)")
     print("=" * 60)
     print("1. Sign in in the browser (email / passkey / code).")
     print("2. Wait until you see Hi, <name> on Target.")
@@ -77,5 +85,10 @@ def wait_for_login(driver: Driver, data):
 
 
 if __name__ == "__main__":
+    print(
+        "Note: prefer ./scripts/session-target.sh (auto email-OTP).\n"
+        "Continuing with manual wait…\n",
+        file=sys.stderr,
+    )
     prepare_runtime()
     print(wait_for_login())

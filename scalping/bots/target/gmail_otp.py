@@ -21,7 +21,7 @@ from email.message import Message
 
 from dotenv import load_dotenv
 
-from scraping.config import PROJECT_ROOT
+from scalping.bots.target.config import PROJECT_ROOT
 
 # Target verification codes are typically 6 digits; allow 4–8.
 OTP_RE = re.compile(r"(?<!\d)(\d{4,8})(?!\d)")
