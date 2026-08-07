@@ -243,8 +243,23 @@ def clear_target_otp(env_path: Path | None = None) -> None:
     path.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 
 
+def resolve_config_path(path: Path | str | None = None) -> Path:
+    """Resolve config path; relative paths are from the repo root (not cwd)."""
+    if path is None:
+        return DEFAULT_CONFIG_PATH
+    path = Path(path)
+    if path.is_absolute():
+        return path
+    if path.exists():
+        return path.resolve()
+    candidate = PROJECT_ROOT / path
+    if candidate.exists():
+        return candidate
+    return path
+
+
 def load_config(path: Path | None = None) -> AppConfig:
-    config_path = path or DEFAULT_CONFIG_PATH
+    config_path = resolve_config_path(path)
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     reload_dotenv()
 

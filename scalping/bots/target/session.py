@@ -8,8 +8,9 @@ Used by:
 from __future__ import annotations
 
 import json
+import random
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from botasaurus.browser import Driver, browser
@@ -19,6 +20,7 @@ from scalping.bots.target.gmail_otp import load_gmail_credentials, wait_for_gmai
 from scalping.bots.target.runtime import CHROME_ADD_ARGUMENTS, COOKIES_PATH, PROFILE_DIR, prepare_runtime
 from scalping.bots.target.checkout import (
     _otp_entry_visible,
+    _target_auth_error_visible,
     click_get_a_code_button,
     disable_webauthn_prompts,
     request_email_code,
@@ -73,13 +75,12 @@ def check_signed_in(driver: Driver) -> bool:
     """Navigate to /account and report whether the profile is authenticated."""
     try:
         driver.get(TARGET_ACCOUNT)
-        time.sleep(1.5)
+        time.sleep(0.7)
     except Exception:
         pass
     if looks_signed_in(driver):
         return True
-    # Sometimes account redirects slowly
-    time.sleep(1.0)
+    time.sleep(0.35)
     return looks_signed_in(driver)
 
 
@@ -252,63 +253,91 @@ def login_with_email_otp(
     email: str,
     timeout: float = 120.0,
 ) -> bool:
-    """Full email → Get a code → Gmail OTP → verify. Returns True if signed in."""
+    """Gentle email → Get a code → Gmail OTP → verify.
+
+    One fill, one Continue, a couple of Get a code clicks max. If Target shows
+    "Something went wrong on our end", we stop — hammering that screen is what
+    triggers harder blocks.
+    """
     if check_signed_in(driver):
         print("[LOGIN] already signed in")
         return True
 
     open_login(driver)
+    time.sleep(random.uniform(0.6, 1.1))
     if looks_signed_in(driver):
         return True
 
-    # Username / email step
-    for attempt in range(1, 5):
+    if _target_auth_error_visible(driver):
+        print(
+            "[LOGIN] Target error banner already on login — aborting auto-login. "
+            "Wait a few minutes, then: ./scripts/session-target.sh --force"
+        )
+        return False
+
+    # Username / email — at most 2 calm attempts (not 4× open_login spam).
+    for attempt in range(1, 3):
         if _otp_entry_visible(driver) or "get a code" in _page_lower(driver):
             break
-        sel = _wait_for_username(driver, timeout=8)
+        if _target_auth_error_visible(driver):
+            print("[LOGIN] error banner during email step — stopping")
+            return False
+        sel = _wait_for_username(driver, timeout=10)
         if not sel:
             print(f"[LOGIN] no username field (attempt {attempt})")
-            open_login(driver)
+            if attempt == 1:
+                time.sleep(1.5)
+                open_login(driver)
+                time.sleep(1.0)
             continue
         if not _fill_selector(driver, sel, email):
             print(f"[LOGIN] could not fill {sel}")
+            time.sleep(1.0)
             continue
         print(f"[LOGIN] entered email via {sel}")
-        time.sleep(0.2)
+        time.sleep(random.uniform(0.4, 0.9))
         _click_login_continue(driver)
-        time.sleep(0.9)
+        time.sleep(random.uniform(0.8, 1.4))
         disable_webauthn_prompts(driver)
         if _otp_entry_visible(driver) or "get a code" in _page_lower(driver):
             break
+        if _target_auth_error_visible(driver):
+            print("[LOGIN] error after Continue — stopping (do not re-click)")
+            return False
+        # One soft second Continue only.
+        time.sleep(random.uniform(0.7, 1.2))
         _click_login_continue(driver)
-        time.sleep(0.7)
+        time.sleep(random.uniform(0.8, 1.3))
+        break
 
     disable_webauthn_prompts(driver)
-    code_requested_at = datetime.now(timezone.utc)
-    print("[LOGIN] Get a code (email OTP, not passkey)")
-    if not request_email_code(driver, force_new=False):
-        for _ in range(12):
-            if _otp_entry_visible(driver):
-                break
-            click_get_a_code_button(driver)
-            time.sleep(0.12)
-    if not _otp_entry_visible(driver):
-        driver.run_js(
-            """
-            const nodes = Array.from(document.querySelectorAll('button,a,[role="button"]'));
-            for (const n of nodes) {
-              const t=((n.innerText||'')+'').replace(/\\s+/g,' ').trim().toLowerCase();
-              if (t.includes('get a code') || t.includes('email me a code')
-                  || t.includes('send a code') || t.includes('email code')) {
-                n.click(); return t;
-              }
-            }
-            return null;
-            """
-        )
-        time.sleep(0.6)
-        request_email_code(driver, force_new=False)
+    try:
+        if hasattr(driver, "enable_human_mode"):
+            driver.enable_human_mode()
+    except Exception:
+        pass
 
+    if _target_auth_error_visible(driver):
+        print("[LOGIN] error before Get a code — abort")
+        return False
+
+    print("[LOGIN] Get a code (email OTP) — gentle, max a few clicks")
+    code_requested_at = datetime.now(timezone.utc)
+    if not request_email_code(driver, force_new=False):
+        if _target_auth_error_visible(driver):
+            print("[LOGIN] blocked by Target error page — try again later manually")
+            return False
+        # One more spaced attempt only.
+        time.sleep(random.uniform(2.0, 3.5))
+        if not request_email_code(driver, force_new=False):
+            print("[LOGIN] OTP field never appeared (gentle path)")
+            return False
+
+    if not _otp_entry_visible(driver):
+        print("[LOGIN] OTP field never appeared")
+        return False
+
+    code_requested_at = datetime.now(timezone.utc) - timedelta(seconds=20)
     print(f"[LOGIN] waiting ≤{int(timeout)}s for Gmail OTP…")
     code = wait_for_gmail_otp(newer_than=code_requested_at, timeout_seconds=timeout)
     if not code:
@@ -326,14 +355,14 @@ def login_with_email_otp(
 
     print(f"[LOGIN] submitting OTP ({len(code)} digits)")
     submit_otp(driver, code)
-    deadline = time.time() + 30
+    deadline = time.time() + 20
     while time.time() < deadline:
         if looks_signed_in(driver):
             break
         url = (driver.current_url or "").lower()
         if "target.com" in url and "/login" not in url:
             break
-        time.sleep(0.4)
+        time.sleep(0.35)
 
     ok = check_signed_in(driver)
     print(f"[LOGIN] signed_in={ok}")
@@ -344,7 +373,7 @@ def save_session(driver: Driver, *, known_signed_in: bool | None = None) -> dict
     """Persist cookies from a stable www.target.com context (avoids CDP context errors)."""
     try:
         driver.get(TARGET_HOME)
-        time.sleep(1.0)
+        time.sleep(0.35)
     except Exception as exc:
         print(f"[LOGIN] navigate home before save: {exc}")
 
@@ -408,9 +437,16 @@ def _browser_ensure_session(driver: Driver, data: dict) -> dict[str, Any]:
 
     ok = login_with_email_otp(driver, email=email, timeout=timeout)
     if not ok:
-        raise RuntimeError(
-            "Auto-login failed. Check GMAIL_APP_PASSWORD / Target email code delivery."
+        # Return a dict (don't raise) — Botasaurus often swallows exceptions → None.
+        msg = (
+            "Auto-login failed. If Target showed 'Something went wrong on our end', "
+            "you are soft-blocked — wait 10–30 minutes, turn VPN off, then either:\n"
+            "  • Sign in manually in the bot Chrome profile, or\n"
+            "  • Re-run: ./scripts/session-target.sh --force\n"
+            "Do not spam Continue / Get a code."
         )
+        print(f"[LOGIN] {msg}")
+        return {"signed_in": False, "error": "login_failed_or_soft_blocked"}
     return save_session(driver, known_signed_in=True)
 
 
@@ -446,6 +482,87 @@ def ensure_target_session(
     return _browser_ensure_session(
         {"email": creds.login, "timeout": timeout, "force": force}
     )
+
+
+def quick_signed_in(driver: Driver) -> bool:
+    """Fast signed-in probe — prefer current page / home before /account."""
+    if looks_signed_in(driver):
+        return True
+    url = (driver.current_url or "").lower()
+    if "target.com" in url and "/login" not in url:
+        text = _page_lower(driver)
+        if "sign in or create account" in text[:1200] and "hi," not in text:
+            return False
+        if "hi," in text or "sign out" in text:
+            return True
+    try:
+        driver.get(TARGET_HOME)
+        time.sleep(0.28)
+    except Exception:
+        pass
+    if looks_signed_in(driver):
+        return True
+    return check_signed_in(driver)
+
+
+def ensure_signed_in_on_driver(
+    driver: Driver,
+    *,
+    email: str | None = None,
+    timeout: float = 90.0,
+    force: bool = False,
+) -> bool:
+    """Ensure this browser is logged in. No-op when already signed in (fast).
+
+    Used by the main bot so a stale session re-logins in the same Chrome
+    window instead of launching a second browser first.
+    """
+    if not force and quick_signed_in(driver):
+        print("[LOGIN] session OK")
+        return True
+
+    # If Target is already showing the soft-block error page, do not start OTP.
+    from scalping.bots.target.checkout import _target_auth_error_visible
+
+    if _target_auth_error_visible(driver):
+        print(
+            "[LOGIN] Target error wall present — refusing auto-login spam. "
+            "Wait 5–10 minutes, then ./scripts/session-target.sh --force once."
+        )
+        return False
+
+    from scalping.bots.target.config import PROJECT_ROOT
+    from scalping.bots.target.gmail_otp import load_gmail_credentials
+
+    load_dotenv(PROJECT_ROOT / ".env", override=True)
+    creds = load_gmail_credentials()
+    mail = (email or creds.login or "").strip()
+    if not mail or not creds.is_configured:
+        raise RuntimeError(
+            "Logged out of Target and GMAIL_LOGIN / GMAIL_APP_PASSWORD missing — cannot auto-login"
+        )
+    print("[LOGIN] logged out — gentle email OTP re-login (not spam)…")
+    ok = login_with_email_otp(driver, email=mail, timeout=timeout)
+    if ok:
+        try:
+            save_session(driver, known_signed_in=True)
+        except Exception as exc:
+            print(f"[LOGIN] cookie save skipped: {exc}")
+    return ok
+
+
+def looks_logged_out_wall(driver: Driver) -> bool:
+    """True when the current page is clearly a Target auth wall."""
+    url = (driver.current_url or "").lower()
+    if "/login" in url or "identity.target.com" in url:
+        return True
+    text = _page_lower(driver)[:1600]
+    if "sign in or create account" in text and "hi," not in text:
+        return True
+    if "enter your email or mobile" in text or "get a code" in text:
+        if "add to cart" not in text and "ship it" not in text:
+            return True
+    return False
 
 
 def is_target_session_logged_in() -> bool:

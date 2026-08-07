@@ -43,17 +43,42 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         ok = is_target_session_logged_in()
         print(json.dumps({"signed_in": ok}, indent=2))
+        if not ok:
+            print(
+                "Logged out — run without --check to auto email-OTP login:\n"
+                "  ./scripts/session-target.sh\n"
+                "Or just start the bot; it re-logins in-browser if needed:\n"
+                "  ./scripts/run-target.sh --config configs/target/tonight.json --place-order",
+                file=sys.stderr,
+            )
         return 0 if ok else 2
 
     try:
         meta = ensure_target_session(force=args.force, timeout=args.timeout)
     except Exception as exc:
-        print(f"[LOGIN] FAILED: {exc}")
+        print(f"[LOGIN] FAILED: {exc}", file=sys.stderr)
         return 1
+
+    if not meta:
+        print(
+            "[LOGIN] FAILED: no session result (browser task aborted).\n"
+            "Target may be soft-blocking this profile. Wait, then sign in manually\n"
+            "in ~/.scalping/chrome-profiles/target or retry:\n"
+            "  ./scripts/session-target.sh --force",
+            file=sys.stderr,
+        )
+        return 1
+
     print(json.dumps(meta, indent=2, default=str))
-    if not meta.get("signed_in", True):
-        # save_session may set signed_in from homepage text; re-check loosely
-        return 0
+    if not meta.get("signed_in"):
+        err = meta.get("error") or "not_signed_in"
+        print(
+            f"[LOGIN] not signed in ({err}).\n"
+            "If you saw Target's 'Something went wrong' banner, wait before retrying.\n"
+            "Spam-clicking Continue makes the block worse.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

@@ -1,12 +1,12 @@
 {
-  "refresh_interval_seconds": 0.25,
-  "refresh_jitter_seconds": 0.05,
+  "refresh_interval_seconds": 0.12,
+  "refresh_jitter_seconds": 0.02,
   "max_atc_retries": 5,
   "dry_run": true,
   "place_order": false,
   "prefer_pickup": false,
   "preferred_store_name": "Albuquerque Wyoming",
-  "checkout_auth_timeout_seconds": 180,
+  "checkout_auth_timeout_seconds": 120,
   "parallel": false,
   "shipping_address": {
     "name": "",

@@ -33,6 +33,10 @@ from scalping.bots.target.runtime import (
     prepare_browser_profile,
     prepare_runtime,
 )
+from scalping.bots.target.session import (
+    ensure_signed_in_on_driver,
+    looks_logged_out_wall,
+)
 from scalping.bots.target.checkout import (
     CheckoutResult,
     cart_has_items,
@@ -49,9 +53,10 @@ from scalping.bots.target.stock import (
     dismiss_post_atc_modals,
     open_product,
 )
+from scalping.bots.target.api import poll_fulfillment_api, warm_cart_session
 
 
-TERMINAL_STATUSES = frozenset({"ready", "purchased", "atc_failed", "error"})
+TERMINAL_STATUSES = frozenset({"ready", "purchased", "error"})
 
 
 @dataclass
@@ -64,34 +69,62 @@ class ItemRunResult:
 
 
 def _sleep_poll(config: AppConfig) -> None:
-    base = max(0.15, float(config.refresh_interval_seconds))
+    base = max(0.08, float(config.refresh_interval_seconds))
     jitter = max(0.0, float(config.refresh_jitter_seconds))
     delay = base + (random.uniform(0, jitter) if jitter else 0.0)
     time.sleep(delay)
 
 
-def _attempt_purchase(driver: Driver, item: ItemConfig, config: AppConfig) -> ItemRunResult:
-    """Assume the driver is already on the item PDP."""
-    stock = check_stock(driver, item, navigate=False)
-    if stock.status != StockStatus.IN_STOCK:
-        return ItemRunResult(
-            label=item.label,
-            url=item.normalized_url,
-            status=stock.status.value,
-            detail=stock.reason,
-        )
+def _poll_stock(
+    driver: Driver,
+    item: ItemConfig,
+    config: AppConfig,
+    *,
+    attempt: int,
+):
+    """Fast stock poll: Redsky in-browser every tick; DOM reload every few polls."""
+    # Keep PDP cookies / CORS context warm — navigate only when needed.
+    need_nav = attempt == 1 or attempt % 8 == 0
+    if need_nav:
+        open_product(driver, item, force_navigate=(attempt == 1))
 
+    api = poll_fulfillment_api(
+        driver,
+        tcin=item.tcin or "",
+        zip_code=config.shipping_address.zip or "87111",
+        state=config.shipping_address.state or "NM",
+        prefer_pickup=config.prefer_pickup,
+    )
+    if api.status == StockStatus.IN_STOCK:
+        # Confirm buy-box when API says buyable (avoid related-product false positives
+        # on DOM; API is authoritative for allocation).
+        print(f"[STOCK] api IN_STOCK — {api.reason} ({api.page_text_excerpt})")
+        if need_nav or attempt % 3 == 0:
+            dom = check_stock(driver, item, navigate=False)
+            if dom.status == StockStatus.OUT_OF_STOCK:
+                # API ahead of UI or race — trust API for ATC attempt.
+                print(f"[STOCK] DOM says OOS ({dom.reason}) but API buyable — ATC anyway")
+        return api
+
+    if api.status == StockStatus.OUT_OF_STOCK:
+        return api
+
+    # API unknown / captcha → fall back to DOM
+    if need_nav:
+        return check_stock(driver, item, navigate=False)
+    open_product(driver, item, force_navigate=False)
+    return check_stock(driver, item, navigate=False)
+
+
+def _attempt_purchase(driver: Driver, item: ItemConfig, config: AppConfig) -> ItemRunResult:
+    """Assume stock was just confirmed; run ATC + checkout."""
     print(f"[IN STOCK] {item.label} ({item.tcin}) — adding to cart")
     atc_ok = False
     for attempt in range(1, config.max_atc_retries + 1):
-        # Clear only on retries (monitor already cleared once up front).
+        # Under drop traffic, do NOT clear cart between ATC tries — that wastes
+        # the window and races other shoppers. Only re-open PDP if needed.
         if attempt > 1:
-            try:
-                clear_cart(driver)
-            except Exception as exc:
-                print(f"[CART] pre-ATC clear skipped: {exc}")
             open_product(driver, item, force_navigate=True)
-            driver.sleep(0.2)
         if add_to_cart(driver, item, prefer_pickup=config.prefer_pickup):
             dismiss_post_atc_modals(driver)
             # Jump straight to cart via the drawer CTA — don't sit on the PDP.
@@ -100,18 +133,17 @@ def _attempt_purchase(driver: Driver, item: ItemConfig, config: AppConfig) -> It
                     trim_cart_to_max_lines(driver, max_lines=1)
                 atc_ok = True
                 break
-            print(f"[ATC] click ok but cart empty; retry {attempt}")
+            print(f"[ATC] landed but cart empty; retry {attempt}/{config.max_atc_retries}")
             continue
-        print(f"[ATC] click failed; retry {attempt}/{config.max_atc_retries}")
-        open_product(driver, item, force_navigate=True)
-        driver.sleep(0.2)
+        print(f"[ATC] failed; retry {attempt}/{config.max_atc_retries}")
 
     if not atc_ok:
+        # Keep polling — drop traffic often means soft fails, not true OOS.
         return ItemRunResult(
             label=item.label,
             url=item.normalized_url,
-            status="atc_failed",
-            detail=f"Could not add to cart after {config.max_atc_retries} tries",
+            status="atc_retry",
+            detail=f"ATC soft-fail after {config.max_atc_retries} tries — keep polling",
         )
 
     checkout = choose_fulfillment_and_checkout(driver, config)
@@ -132,8 +164,23 @@ def monitor_item_until_bought(
     *,
     max_attempts: int | None = None,
     clear_cart_first: bool = True,
+    ensure_login: bool = True,
+    login_timeout: float = 90.0,
+    force_login: bool = False,
 ) -> ItemRunResult:
     """Refresh a single PDP until in stock, then checkout that item alone."""
+    if ensure_login:
+        ok = ensure_signed_in_on_driver(
+            driver, timeout=login_timeout, force=force_login
+        )
+        if not ok:
+            return ItemRunResult(
+                label=item.label,
+                url=item.normalized_url,
+                status="error",
+                detail="Target login required but auto re-login failed",
+            )
+
     if clear_cart_first:
         try:
             print(f"[CART] clearing before {item.label}")
@@ -141,12 +188,41 @@ def monitor_item_until_bought(
         except Exception as exc:
             print(f"[CART] clear skipped: {exc}")
 
+    # Warm cart session + land on PDP before the hot loop.
+    open_product(driver, item, force_navigate=True)
+    warm = warm_cart_session(driver)
+    print(f"[ATC] pre-warm cart_views status={warm.get('status')}")
+
     attempt = 0
+    relogin_tries = 0
     while True:
         attempt += 1
         print(f"[POLL {attempt}] {item.label} → {item.normalized_url}")
-        open_product(driver, item, force_navigate=(attempt == 1))
-        result = _attempt_purchase(driver, item, config)
+
+        if looks_logged_out_wall(driver) and ensure_login and relogin_tries < 2:
+            relogin_tries += 1
+            print(f"[LOGIN] auth wall mid-poll — re-login ({relogin_tries}/2)")
+            if not ensure_signed_in_on_driver(driver, timeout=login_timeout, force=True):
+                return ItemRunResult(
+                    label=item.label,
+                    url=item.normalized_url,
+                    status="error",
+                    detail="Logged out mid-run; re-login failed",
+                )
+            open_product(driver, item, force_navigate=True)
+
+        stock = _poll_stock(driver, item, config, attempt=attempt)
+        print(f"[POLL {attempt}] {stock.status.value} — {stock.reason}")
+
+        if stock.status == StockStatus.IN_STOCK:
+            result = _attempt_purchase(driver, item, config)
+        else:
+            result = ItemRunResult(
+                label=item.label,
+                url=item.normalized_url,
+                status=stock.status.value,
+                detail=stock.reason,
+            )
 
         if result.status in TERMINAL_STATUSES:
             return result
@@ -188,6 +264,9 @@ def run_items_sequentially(driver: Driver, data: dict):
     config: AppConfig = data["config"]
     max_attempts = data.get("max_attempts")
     clear_cart_first = bool(data.get("clear_cart_first", True))
+    ensure_login = not bool(data.get("skip_login_check"))
+    login_timeout = float(data.get("login_timeout") or 90)
+    force_login = bool(data.get("force_login"))
     results: list[ItemRunResult] = []
 
     for item in config.enabled_items:
@@ -200,7 +279,12 @@ def run_items_sequentially(driver: Driver, data: dict):
             config,
             max_attempts=max_attempts,
             clear_cart_first=clear_cart_first,
+            ensure_login=ensure_login,
+            login_timeout=login_timeout,
+            force_login=force_login,
         )
+        # Only force login on the first item.
+        force_login = False
         results.append(result)
         print(f"[DONE] {item.label}: {result.status} — {result.detail}")
 
@@ -224,12 +308,16 @@ def _make_single_item_runner(profile: Path):
         item: ItemConfig = data["item"]
         max_attempts = data.get("max_attempts")
         clear_cart_first = bool(data.get("clear_cart_first", True))
+        ensure_login = not bool(data.get("skip_login_check"))
         result = monitor_item_until_bought(
             driver,
             item,
             config,
             max_attempts=max_attempts,
             clear_cart_first=clear_cart_first,
+            ensure_login=ensure_login,
+            login_timeout=float(data.get("login_timeout") or 90),
+            force_login=bool(data.get("force_login")),
         )
         return _result_to_dict(result)
 
@@ -250,17 +338,29 @@ def run_single_item(driver: Driver, data: dict):
     item: ItemConfig = data["item"]
     max_attempts = data.get("max_attempts")
     clear_cart_first = bool(data.get("clear_cart_first", True))
+    ensure_login = not bool(data.get("skip_login_check"))
     result = monitor_item_until_bought(
         driver,
         item,
         config,
         max_attempts=max_attempts,
         clear_cart_first=clear_cart_first,
+        ensure_login=ensure_login,
+        login_timeout=float(data.get("login_timeout") or 90),
+        force_login=bool(data.get("force_login")),
     )
     return _result_to_dict(result)
 
 
-def run_items_parallel(config: AppConfig, *, max_attempts: int | None = None, clear_cart_first: bool = True) -> list[dict]:
+def run_items_parallel(
+    config: AppConfig,
+    *,
+    max_attempts: int | None = None,
+    clear_cart_first: bool = True,
+    skip_login_check: bool = False,
+    force_login: bool = False,
+    login_timeout: float = 90.0,
+) -> list[dict]:
     """One browser per item so stock on item A never blocks buying item B."""
 
     items = config.enabled_items
@@ -283,6 +383,9 @@ def run_items_parallel(config: AppConfig, *, max_attempts: int | None = None, cl
                 "item": item,
                 "max_attempts": max_attempts,
                 "clear_cart_first": clear_cart_first,
+                "skip_login_check": skip_login_check,
+                "force_login": force_login,
+                "login_timeout": login_timeout,
             }
         )
         print(f"[MONITOR] done {item.label}: {result.get('status')} — {result.get('detail')}")
@@ -384,23 +487,16 @@ def main(argv: list[str] | None = None) -> None:
         config = replace(config, parallel=False)
 
     clear_cart_first = not args.no_clear_cart
-
+    login_payload = {
+        "skip_login_check": bool(args.skip_login_check),
+        "force_login": bool(args.force_login),
+        "login_timeout": float(config.checkout_auth_timeout_seconds or 90),
+    }
     if not args.skip_login_check:
-        print("[LOGIN] ensuring Target session (email OTP if stale)…")
-        try:
-            from scalping.bots.target.session import ensure_target_session
-
-            meta = ensure_target_session(
-                force=bool(args.force_login),
-                timeout=float(config.checkout_auth_timeout_seconds or 120),
-            )
-            print(f"[LOGIN] session ready cookies={meta.get('cookie_count')}")
-        except Exception as exc:
-            raise SystemExit(
-                f"Target login failed: {exc}\n"
-                "Fix GMAIL_LOGIN / GMAIL_APP_PASSWORD, or run: "
-                "./sessions/run_target_session.sh"
-            ) from exc
+        print(
+            "[LOGIN] will verify in the bot browser "
+            "(auto email-OTP only if logged out)"
+        )
 
     print(f"Items: {len(config.enabled_items)}")
     print(f"dry_run={config.dry_run} place_order={config.place_order}")
@@ -446,6 +542,7 @@ def main(argv: list[str] | None = None) -> None:
             config,
             max_attempts=args.max_attempts,
             clear_cart_first=clear_cart_first,
+            **login_payload,
         )
     else:
         results = run_items_sequentially(
@@ -453,6 +550,7 @@ def main(argv: list[str] | None = None) -> None:
                 "config": config,
                 "max_attempts": args.max_attempts,
                 "clear_cart_first": clear_cart_first,
+                **login_payload,
             }
         )
 

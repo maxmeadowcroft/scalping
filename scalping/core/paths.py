@@ -22,6 +22,7 @@ TARGET_PARALLEL_PROFILES_DIR = PROFILES_DIR / "target-parallel"
 CONFIG_DIR = REPO_ROOT / "configs"
 TARGET_CONFIG_DIR = CONFIG_DIR / "target"
 ROUND1_CONFIG_DIR = CONFIG_DIR / "round1"
+BANDAI_CONFIG_DIR = CONFIG_DIR / "bandai"
 
 
 def ensure_data_dirs() -> None:
@@ -47,3 +48,8 @@ def target_config(name: str = "default") -> Path:
 def round1_config(name: str = "default") -> Path:
     stem = name if name.endswith(".json") else f"{name}.json"
     return ROUND1_CONFIG_DIR / stem
+
+
+def bandai_config(name: str = "default") -> Path:
+    stem = name if name.endswith(".json") else f"{name}.json"
+    return BANDAI_CONFIG_DIR / stem

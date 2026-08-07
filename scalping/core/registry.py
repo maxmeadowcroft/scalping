@@ -52,6 +52,7 @@ def _load_builtin_bots() -> None:
     if _LOADED:
         return
     # Import side-effects register bots
+    from scalping.bots import bandai as _bandai  # noqa: F401
     from scalping.bots import round1 as _round1  # noqa: F401
     from scalping.bots import target as _target  # noqa: F401
 

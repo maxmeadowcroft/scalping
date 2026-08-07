@@ -16,19 +16,21 @@ class TargetBot(BaseBot):
     description = "Poll Target PDPs, ATC, checkout (shipping/pickup), optional place-order"
 
     def ensure_session(self, ctx: BotContext) -> None:
+        # Login is handled inside the bot browser (same window) for speed.
+        # Only force a separate session browser when explicitly requested.
         if ctx.extra.get("skip_login_check"):
             self.log.info("skip_login_check set — not refreshing session")
+            return
+        if not ctx.extra.get("force_login"):
             return
         from scalping.bots.target.session import ensure_target_session
 
         timeout = float(ctx.extra.get("login_timeout") or 120)
-        force = bool(ctx.extra.get("force_login"))
-        self.log.info("ensuring Target session force=%s", force)
-        meta = ensure_target_session(force=force, timeout=timeout)
+        self.log.info("force_login — refreshing Target session")
+        meta = ensure_target_session(force=True, timeout=timeout)
         self.log.info("session cookies=%s", meta.get("cookie_count"))
 
     def run(self, ctx: BotContext) -> BotResult:
-        # Build argv for the existing CLI so behavior stays identical.
         argv = list(ctx.argv)
         if ctx.config_path:
             argv = ["--config", str(ctx.config_path), *argv]
@@ -38,14 +40,12 @@ class TargetBot(BaseBot):
             argv.append("--dry-run")
         if ctx.extra.get("skip_login_check") and "--skip-login-check" not in argv:
             argv.append("--skip-login-check")
-        # Session already handled in ensure_session — avoid double login.
-        if "--skip-login-check" not in argv:
-            argv.append("--skip-login-check")
+        if ctx.extra.get("force_login") and "--force-login" not in argv:
+            argv.append("--force-login")
 
         from scalping.bots.target.cli import main as target_main
 
         code = target_main(argv)
-        # target_main returns None historically — treat as 0
         exit_code = int(code or 0)
         return BotResult(
             ok=exit_code == 0,

@@ -26,7 +26,20 @@ COOKIES_PATH = DATA_ROOT / "sessions" / "target_cookies.json"
 PARALLEL_PROFILES_DIR = DATA_ROOT / "chrome-profiles" / "target-parallel"
 PROFILE_LOCK_PATH = DATA_ROOT / "chrome-profiles" / "target.browser.lock"
 
-# Stable Chrome flags for automation profiles (passed via Botasaurus add_arguments).
+# Prefer a real Chrome desktop UA. Spoofing Mobile Safari on Chromium is a
+# strong bot signal and correlates with T83072242 (_ERR_AUTH_DENIED) on cart.
+DESKTOP_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/128.0.0.0 Safari/537.36"
+)
+# Kept for optional mobile experiments.
+MOBILE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 "
+    "Mobile/15E148 Safari/604.1"
+)
+
 CHROME_ADD_ARGUMENTS = [
     "--disable-session-crashed-bubble",
     # Bundle WebAuthn-related flags with existing disable-features (Chrome keeps last wins messy).
@@ -34,6 +47,8 @@ CHROME_ADD_ARGUMENTS = [
     "--hide-crash-restore-bubble",
     "--noerrdialogs",
     "--disable-popup-blocking",
+    f"--user-agent={DESKTOP_UA}",
+    "--window-size=1280,900",
 ]
 
 

@@ -1,12 +1,12 @@
 {
-  "refresh_interval_seconds": 0.25,
-  "refresh_jitter_seconds": 0.05,
-  "max_atc_retries": 5,
-  "dry_run": false,
-  "place_order": true,
+  "refresh_interval_seconds": 0.35,
+  "refresh_jitter_seconds": 0.15,
+  "max_atc_retries": 12,
+  "dry_run": true,
+  "place_order": false,
   "prefer_pickup": false,
   "preferred_store_name": "Albuquerque Wyoming",
-  "checkout_auth_timeout_seconds": 180,
+  "checkout_auth_timeout_seconds": 120,
   "parallel": false,
   "shipping_address": {
     "name": "Maximus Meadowcroft",
@@ -19,9 +19,9 @@
   },
   "items": [
     {
-      "url": "https://www.target.com/p/-/A-1011960739",
-      "max_quantity": 5,
-      "label": "pokemon-first-partner-s3",
+      "url": "https://www.target.com/p/zephyr/-/A-1011483406",
+      "max_quantity": 1,
+      "label": "pokemon-mega-evolution-pitch-black-etb",
       "enabled": true
     }
   ]

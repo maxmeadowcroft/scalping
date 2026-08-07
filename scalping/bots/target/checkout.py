@@ -97,8 +97,80 @@ def _human_pause(driver: Driver, lo: float = 0.05, hi: float = 0.14) -> None:
     time.sleep(random.uniform(lo, hi))
 
 
+def _enable_human_mouse(driver: Driver) -> None:
+    """Best-effort Botasaurus human mouse mode (smooth cursor moves)."""
+    try:
+        if hasattr(driver, "enable_human_mode"):
+            driver.enable_human_mode()
+    except Exception:
+        pass
+
+
+def _element_click_point(driver: Driver, selector: str) -> tuple[int, int] | None:
+    """Visible center of selector with slight pixel jitter (never #passkey)."""
+    if "passkey" in selector.lower():
+        return None
+    try:
+        point = driver.run_js(
+            f"""
+            const el = document.querySelector({selector!r});
+            if (!el) return null;
+            if ((el.id || '').toLowerCase() === 'passkey') return null;
+            el.scrollIntoView({{block: 'center', inline: 'nearest'}});
+            const r = el.getBoundingClientRect();
+            if (r.width < 4 || r.height < 4) return null;
+            const ox = (Math.random() * 0.36) - 0.18;
+            const oy = (Math.random() * 0.36) - 0.18;
+            return {{
+              x: Math.round(r.left + r.width * (0.5 + ox)),
+              y: Math.round(r.top + r.height * (0.5 + oy)),
+            }};
+            """
+        )
+    except Exception:
+        return None
+    if isinstance(point, dict) and "x" in point and "y" in point:
+        return int(point["x"]), int(point["y"])
+    return None
+
+
+def _realistic_click_selector(driver: Driver, selector: str) -> bool:
+    """Move cursor then click — prefers fast jump; falls back to synthetic events."""
+    if "passkey" in selector.lower():
+        return False
+    _enable_human_mouse(driver)
+    point = _element_click_point(driver, selector)
+    if point is not None:
+        x, y = point
+        try:
+            if hasattr(driver, "move_mouse_to_point"):
+                # Jump is much faster than smooth glide for drop night.
+                driver.move_mouse_to_point(x, y, is_jump=True)
+                _human_pause(driver, 0.015, 0.04)
+            if hasattr(driver, "click_at_point"):
+                driver.click_at_point(x, y, skip_move=True)
+                _human_pause(driver, 0.02, 0.05)
+                return True
+            if hasattr(driver, "mouse_press") and hasattr(driver, "mouse_release"):
+                driver.mouse_press(x, y)
+                _human_pause(driver, 0.015, 0.035)
+                driver.mouse_release(x, y)
+                _human_pause(driver, 0.02, 0.05)
+                return True
+        except Exception:
+            pass
+        try:
+            if hasattr(driver, "click"):
+                driver.click(selector, wait=1, skip_move=True)
+                _human_pause(driver, 0.02, 0.05)
+                return True
+        except Exception:
+            pass
+    return _human_click_selector(driver, selector)
+
+
 def _human_click_selector(driver: Driver, selector: str) -> bool:
-    """Fast human-like pointer click with pixel jitter (never for #passkey)."""
+    """Synthetic pointer click with pixel jitter (never for #passkey)."""
     if "passkey" in selector.lower():
         return False
     ox = round(random.uniform(-0.2, 0.2), 3)
@@ -134,7 +206,7 @@ def _human_click_selector(driver: Driver, selector: str) -> bool:
     except Exception:
         return False
     if isinstance(result, dict) and result.get("ok"):
-        _human_pause(driver, 0.03, 0.09)
+        _human_pause(driver, 0.015, 0.04)
         return True
     return _js_click(driver, selector)
 
@@ -300,7 +372,7 @@ def clear_cart(driver: Driver, *, max_rounds: int = 12) -> None:
     which can hit unrelated UI and race with a fresh add-to-cart.
     """
     driver.get("https://www.target.com/cart")
-    driver.sleep(0.3)
+    time.sleep(0.12)
     for _ in range(max_rounds):
         if cart_is_empty(driver):
             return
@@ -329,11 +401,11 @@ def clear_cart(driver: Driver, *, max_rounds: int = 12) -> None:
         if removed == 0:
             if not (
                 _js_click(driver, '[data-test="cartItem-deleteBtn"]')
-                or _click_selector(driver, '[data-test="cartItem-deleteBtn"]', wait=0.3)
+                or _click_selector(driver, '[data-test="cartItem-deleteBtn"]', wait=0.12)
             ):
                 break
-        driver.sleep(0.22)
-    driver.sleep(0.12)
+        time.sleep(0.08)
+    time.sleep(0.05)
 
 
 def cart_is_empty(driver: Driver) -> bool:
@@ -1091,100 +1163,150 @@ def _activate_role_button(driver: Driver, el_selector: str) -> bool:
     if "passkey" in el_selector.lower():
         print(f"[AUTH] refused to activate passkey selector {el_selector!r}")
         return False
-    ok = _human_click_selector(driver, el_selector)
+    ok = _realistic_click_selector(driver, el_selector)
     if ok:
         print(f"[AUTH] activated {el_selector!r}")
     return ok
 
 
 def click_get_a_code_button(driver: Driver) -> bool:
-    """One fast human click on #otp — never #passkey. No select waits."""
+    """Realistic mouse click on #otp / Get a code — never #passkey."""
     try:
-        result = driver.run_js(
-            f"""
+        driver.run_js(
+            """
             const pk = document.querySelector('#passkey');
-            if (pk) {{
+            if (pk) {
               pk.setAttribute('aria-disabled', 'true');
               pk.style.pointerEvents = 'none';
-            }}
-            let el = document.querySelector('#otp[role="button"]')
-              || document.querySelector('#otp')
-              || document.querySelector('[role="dialog"] #otp');
-            if (!el) {{
-              const nodes = Array.from(document.querySelectorAll('[role="button"], button'));
-              for (const n of nodes) {{
-                if ((n.id || '').toLowerCase() === 'passkey') continue;
-                const t = ((n.innerText || '') + '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                if (t === 'get a code' || t.startsWith('get a code')) {{ el = n; break; }}
-              }}
-            }}
-            if (!el) return {{ok: false}};
-            el.removeAttribute('aria-disabled');
-            el.style.pointerEvents = 'auto';
-            el.scrollIntoView({{block: 'center', inline: 'nearest'}});
-            try {{ el.focus({{preventScroll: true}}); }} catch (e) {{}}
-            const r = el.getBoundingClientRect();
-            const x = r.left + r.width * (0.4 + Math.random() * 0.2);
-            const y = r.top + r.height * (0.4 + Math.random() * 0.2);
-            const opts = (buttons) => ({{
-              bubbles: true, cancelable: true, view: window,
-              clientX: x, clientY: y, button: 0, buttons,
-              pointerId: 1, pointerType: 'mouse', isPrimary: true,
-            }});
-            el.dispatchEvent(new PointerEvent('pointerdown', opts(1)));
-            el.dispatchEvent(new MouseEvent('mousedown', opts(1)));
-            el.dispatchEvent(new PointerEvent('pointerup', opts(0)));
-            el.dispatchEvent(new MouseEvent('mouseup', opts(0)));
-            el.dispatchEvent(new MouseEvent('click', opts(0)));
-            try {{ el.click(); }} catch (e) {{}}
-            return {{ok: true, id: el.id || '', text: ((el.innerText || '') + '').replace(/\\s+/g, ' ').trim().slice(0, 40)}};
+            }
+            """
+        )
+    except Exception:
+        pass
+
+    for sel in ('#otp[role="button"]', "#otp", '[role="dialog"] #otp'):
+        if _realistic_click_selector(driver, sel):
+            return True
+
+    # Text fallback when Target changes the id
+    try:
+        result = driver.run_js(
+            """
+            const nodes = Array.from(document.querySelectorAll('[role="button"], button, a'));
+            for (const n of nodes) {
+              if ((n.id || '').toLowerCase() === 'passkey') continue;
+              const t = ((n.innerText || '') + '').replace(/\\s+/g, ' ').trim().toLowerCase();
+              if (t === 'get a code' || t.startsWith('get a code')
+                  || t.includes('email me a code') || t.includes('send a code')) {
+                n.scrollIntoView({block: 'center', inline: 'nearest'});
+                const r = n.getBoundingClientRect();
+                return {
+                  ok: true,
+                  x: Math.round(r.left + r.width * (0.4 + Math.random() * 0.2)),
+                  y: Math.round(r.top + r.height * (0.4 + Math.random() * 0.2)),
+                };
+              }
+            }
+            return {ok: false};
             """
         )
     except Exception as exc:
-        print(f"[AUTH] Get a code click failed: {exc}")
+        print(f"[AUTH] Get a code locate failed: {exc}")
         return False
     if isinstance(result, dict) and result.get("ok"):
-        return True
+        x, y = int(result["x"]), int(result["y"])
+        _enable_human_mouse(driver)
+        try:
+            if hasattr(driver, "move_mouse_to_point"):
+                driver.move_mouse_to_point(x, y, is_jump=True)
+                _human_pause(driver, 0.015, 0.04)
+            if hasattr(driver, "click_at_point"):
+                driver.click_at_point(x, y, skip_move=True)
+                _human_pause(driver, 0.02, 0.05)
+                return True
+        except Exception:
+            pass
+        # Last resort: synthetic events at those coords via JS on element under point
+        try:
+            driver.run_js(
+                f"""
+                const el = document.elementFromPoint({x}, {y});
+                if (!el) return false;
+                const opts = (buttons) => ({{
+                  bubbles: true, cancelable: true, view: window,
+                  clientX: {x}, clientY: {y}, button: 0, buttons,
+                  pointerId: 1, pointerType: 'mouse', isPrimary: true,
+                }});
+                el.dispatchEvent(new PointerEvent('pointerdown', opts(1)));
+                el.dispatchEvent(new MouseEvent('mousedown', opts(1)));
+                el.dispatchEvent(new PointerEvent('pointerup', opts(0)));
+                el.dispatchEvent(new MouseEvent('mouseup', opts(0)));
+                el.dispatchEvent(new MouseEvent('click', opts(0)));
+                try {{ el.click(); }} catch (e) {{}}
+                return true;
+                """
+            )
+            return True
+        except Exception:
+            return False
     return False
 
 
 def request_email_code(driver: Driver, *, force_new: bool = False) -> bool:
-    """Spam-click Get a code with human jitter until OTP entry appears."""
+    """Request email OTP gently — a few human clicks, then wait.
+
+    Do NOT spam through Target's "Something went wrong on our end" banner; that
+    is how we get rate-limited / T83072242. Stop early and let the user retry.
+    """
     disable_webauthn_prompts(driver)
     if _otp_entry_visible(driver) and not force_new:
         print("[AUTH] OTP entry already visible")
         return True
 
-    if _target_auth_error_visible(driver):
-        print("[AUTH] error banner — ignoring, spam-clicking Get a code")
+    if _target_auth_error_visible(driver) and not force_new:
+        print(
+            "[AUTH] Target error banner visible — NOT spam-clicking. "
+            "Wait / refresh / use session-target.sh manually."
+        )
+        return False
 
     def _ok() -> bool:
         return _otp_entry_visible(driver)
 
     if force_new and _ok():
-        for _ in range(6):
-            clicked = _click_visible_button_text(
-                driver,
-                ("resend", "send a new code", "didn't get a code?", "get a new code"),
-            )
-            if clicked:
-                print(f"[AUTH] clicked resend: {clicked!r}")
-                _human_pause(driver, 0.08, 0.18)
-                return True
-            if not _auth_method_chooser_visible(driver) and _ok():
-                break
-            click_get_a_code_button(driver)
-            _human_pause(driver, 0.05, 0.1)
+        clicked = _click_visible_button_text(
+            driver,
+            ("resend", "send a new code", "didn't get a code?", "get a new code"),
+        )
+        if clicked:
+            print(f"[AUTH] clicked resend once: {clicked!r}")
+            _human_pause(driver, 0.8, 1.4)
+            return True
+        # One Get a code only — never a loop of 8.
+        click_get_a_code_button(driver)
+        _human_pause(driver, 1.0, 1.8)
+        return _ok()
 
-    return _spam_until(
-        driver,
-        action=click_get_a_code_button,
-        success=_ok,
-        label="Get a code",
-        max_tries=40,
-        peek_lo=0.04,
-        peek_hi=0.1,
-    )
+    # Soft path: at most 3 spaced clicks.
+    max_tries = 3
+    for i in range(1, max_tries + 1):
+        if _ok():
+            if i > 1:
+                print(f"[AUTH] Get a code landed on try {i}")
+            return True
+        if _target_auth_error_visible(driver):
+            print(
+                f"[AUTH] Target 'something went wrong' after click {i} — stopping "
+                "(spam makes it worse)"
+            )
+            return False
+        click_get_a_code_button(driver)
+        if _ok():
+            print(f"[AUTH] Get a code landed on try {i}")
+            return True
+        # Human-scale pause between attempts.
+        _human_pause(driver, 1.2, 2.2)
+    return bool(_ok())
 
 
 def _paste_into_selector(driver: Driver, selector: str, value: str) -> bool:
@@ -1354,7 +1476,7 @@ def wait_for_checkout_auth(driver: Driver, *, timeout_seconds: float) -> bool:
 
         otp = read_target_otp()
         if gmail.is_configured and time.time() >= next_gmail_poll:
-            next_gmail_poll = time.time() + 0.45
+            next_gmail_poll = time.time() + 0.25
             try:
                 gmail_otp = fetch_latest_target_otp(gmail, newer_than=code_requested_at)
             except Exception as exc:
@@ -1394,12 +1516,12 @@ def wait_for_checkout_auth(driver: Driver, *, timeout_seconds: float) -> bool:
             print("[AUTH] still waiting for email — resending code once")
             code_requested_at = datetime.now(timezone.utc) - timedelta(seconds=5)
             request_email_code(driver, force_new=True)
-            next_resend = time.time() + 45.0
+            next_resend = time.time() + 1.0
         elif (not entry_up) and auth_up and time.time() >= next_resend:
             print("[AUTH] chooser/error still up — spam-clicking Get a code")
             code_requested_at = datetime.now(timezone.utc) - timedelta(seconds=5)
             request_email_code(driver, force_new=False)
-            next_resend = time.time() + 1.5
+            next_resend = time.time() + 0.8
 
         if auth_up:
             auth_missing_streak = 0
@@ -1448,7 +1570,7 @@ def start_checkout(driver: Driver, *, wait_auth: bool = True, auth_timeout: floa
     # Direct navigation fallback
     if not clicked and not on_checkout_page(driver) and not step_up_auth_visible(driver):
         driver.get("https://www.target.com/checkout")
-        driver.sleep(0.55)
+        time.sleep(0.2)
         clicked = True
 
     if not wait_auth:
